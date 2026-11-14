@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+
+# Local personal configuration (never commit a real config.json)
+config.json
+dist/config.json
+config.local.json
+
+# Build artefacts
+build/
+dist/
+*.spec.bak
+*.manifest
+build_log*.txt
+
+# Runtime data
+exports/
+backups/
+cidr_score_history.json
+app_debug.log
+crash.log
+launch.log
+*.log
+
+# Speed-test core is downloaded, not committed
+bin/*.exe
+bin/*.zip
+
+# Backups created by the app
+*.bak-*
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Cloudflare speed test runtime results
+bin/current_ips.txt
+bin/current_result.csv
+bin/ip.txt
+bin/test_ips.txt
+bin/test_res.csv
+bin/test_result.csv
