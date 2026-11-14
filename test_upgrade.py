@@ -625,13 +625,17 @@ def free_port() -> int:
 
 
 def test_lan_server(tmp: str, profile_path: str, options: dict):
-    print("\n📋 4. 局域网 HTTP 订阅服务")
+    print("\n📋 4. 局域网 HTTP 订阅服务（Token 认证）")
     import requests
-    from lan_server import LANServerWorker
+    from lan_server import LANServerWorker, generate_token
 
     exports = os.path.join(tmp, "lan_exports")
     os.makedirs(exports, exist_ok=True)
     port = free_port()
+    token = generate_token()
+
+    def token_provider():
+        return token
 
     def factory():
         return ProfileManager(profile_path, os.path.join(tmp, "lan_backups"),
@@ -639,29 +643,50 @@ def test_lan_server(tmp: str, profile_path: str, options: dict):
 
     worker = LANServerWorker(exports, port, profile_mgr=None, profile_factory=factory,
                              profile_path=profile_path, host="127.0.0.1", port_fallback=3,
-                             ensure_firewall=False)
+                             ensure_firewall=False, token_provider=token_provider)
     worker.start()
     deadline = time.time() + 15
     while time.time() < deadline and not worker.actual_port:
         time.sleep(0.1)
     check("服务在独立线程监听", worker.actual_port == port, f"port={worker.actual_port}")
 
-    base = f"http://127.0.0.1:{worker.actual_port}"
+    root = f"http://127.0.0.1:{worker.actual_port}"
+    base = f"{root}/s/{token}"
     try:
+        check("访问 Token 为高强度 URL-safe 字符串",
+              len(token) >= 43 and all(c.isalnum() or c in "-_" for c in token))
+
+        unauth = requests.get(f"{root}/ios.yaml", timeout=10)
+        check("旧的无认证订阅路径已停用",
+              unauth.status_code == 404 and "proxies:" not in unauth.text)
+        check("404 响应不泄露 Token", token not in unauth.text)
+        wrong_token = generate_token()
+        while wrong_token == token:
+            wrong_token = generate_token()
+        wrong = requests.get(f"{root}/s/{wrong_token}/ios.yaml", timeout=10)
+        check("错误 Token 无法获取配置",
+              wrong.status_code == 404 and "proxies:" not in wrong.text)
+        check("根路径不再提供无认证仪表盘",
+              requests.get(f"{root}/", timeout=10).status_code == 404)
+
         resp = requests.get(f"{base}/ios.yaml", timeout=10)
-        check("GET /ios.yaml 返回 200", resp.status_code == 200, resp.headers.get("Content-Type", ""))
+        check("GET /s/<token>/ios.yaml 返回 200", resp.status_code == 200,
+              resp.headers.get("Content-Type", ""))
         check("/ios.yaml 内容为可订阅 YAML",
               "proxies:" in resp.text and "ipv6: false" in resp.text
               and ct.DEFAULT_OPTIONS["stream_group_name"] in resp.text)
+        check("订阅响应不含 CORS 通配符",
+              "Access-Control-Allow-Origin" not in resp.headers)
+        check("订阅响应带 nosniff", resp.headers.get("X-Content-Type-Options") == "nosniff")
 
         resp_flclash = requests.get(f"{base}/flclash.yaml", timeout=10)
-        check("GET /flclash.yaml 返回 200", resp_flclash.status_code == 200)
+        check("GET /s/<token>/flclash.yaml 返回 200", resp_flclash.status_code == 200)
         check("/flclash.yaml 含链式代理与 url-test",
               "dialer-proxy" in resp_flclash.text
               and ct.DEFAULT_OPTIONS["stream_group_name"] in resp_flclash.text)
 
         resp_happ = requests.get(f"{base}/tv_happ.txt", timeout=10)
-        check("GET /tv_happ.txt 返回 200", resp_happ.status_code == 200)
+        check("GET /s/<token>/tv_happ.txt 返回 200", resp_happ.status_code == 200)
         check("/tv_happ.txt 含 Happ 头与 mux=0",
               "#subscription-autoconnect-type: lowestdelay" in resp_happ.text
               and "mux=0" in resp_happ.text)
@@ -669,7 +694,7 @@ def test_lan_server(tmp: str, profile_path: str, options: dict):
               all(ip in resp_happ.text for ip in ["104.17.140.11", "104.18.32.7", "162.159.20.5"]))
 
         resp_json = requests.get(f"{base}/happ.json", timeout=10)
-        check("GET /happ.json 返回 200", resp_json.status_code == 200)
+        check("GET /s/<token>/happ.json 返回 200", resp_json.status_code == 200)
         check("/happ.json queryStrategy=UseIPv4",
               json.loads(resp_json.text)["dns"]["queryStrategy"] == "UseIPv4")
 
@@ -677,15 +702,14 @@ def test_lan_server(tmp: str, profile_path: str, options: dict):
         check("HEAD /ios.yaml 返回 200 且无 body",
               head.status_code == 200 and head.content == b"" and int(head.headers.get("Content-Length", 0)) > 0,
               f"len={head.headers.get('Content-Length')}")
-        check("订阅响应头含更新间隔与 CORS",
-              head.headers.get("Profile-Update-Interval") == "24"
-              and head.headers.get("Access-Control-Allow-Origin") == "*")
+        check("订阅响应头含更新间隔",
+              head.headers.get("Profile-Update-Interval") == "24")
 
         resp_404 = requests.get(f"{base}/nope", timeout=10)
-        check("未知端点返回 404", resp_404.status_code == 404)
-        root = requests.get(f"{base}/", timeout=10)
-        check("根仪表盘 200 且列出新端点",
-              root.status_code == 200 and "/tv_happ.txt" in root.text and "/ios.yaml" in root.text)
+        check("Token 下未知端点返回 404", resp_404.status_code == 404)
+        dash = requests.get(f"{base}/", timeout=10)
+        check("Token 下仪表盘 200 且列出端点",
+              dash.status_code == 200 and "tv_happ.txt" in dash.text and "ios.yaml" in dash.text)
 
         # Freshness: a newer profile must be picked up on the next request.
         later = time.time() + 120
@@ -712,7 +736,7 @@ def test_lan_server(tmp: str, profile_path: str, options: dict):
     busy_port = blocker.getsockname()[1]
     worker2 = LANServerWorker(exports, busy_port, profile_mgr=None, profile_factory=factory,
                               profile_path=profile_path, host="127.0.0.1", port_fallback=5,
-                              ensure_firewall=False)
+                              ensure_firewall=False, token_provider=token_provider)
     try:
         worker2.start()
         deadline = time.time() + 15
@@ -721,8 +745,9 @@ def test_lan_server(tmp: str, profile_path: str, options: dict):
         check("端口占用自动回退", busy_port < worker2.actual_port <= busy_port + 5,
               f"{busy_port} -> {worker2.actual_port}")
         check("回退后仍可响应订阅",
-              requests.get(f"http://127.0.0.1:{worker2.actual_port}/tv_happ.txt",
-                           timeout=10).status_code == 200)
+              requests.get(
+                  f"http://127.0.0.1:{worker2.actual_port}/s/{token}/tv_happ.txt",
+                  timeout=10).status_code == 200)
     finally:
         worker2.stop()
         blocker.close()

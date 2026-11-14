@@ -1,165 +1,185 @@
 # -*- coding: utf-8 -*-
-"""Verification script for LAN Subscription Server & Firewall."""
+"""Verification script for the token-protected LAN subscription server.
 
-import sys
+Uses only synthetic export files (TEST-NET IPs, dummy UUID) so no real airport
+subscription, UUID, password or VPS credential is involved. Firewall calls are
+dry-run only; nothing on the host firewall is modified.
+"""
+
+import base64
+import json
 import os
+import socket
+import sys
+import tempfile
 import time
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import requests
-import base64
-import subprocess
 
-from path_utils import EXPORTS_DIR, BACKUPS_DIR, load_config
-from profile_manager import ProfileManager
-from lan_server import LANServerWorker, get_real_lan_ip, ensure_firewall_rule
+from lan_server import (
+    LANServerWorker, ensure_firewall_rule_detailed, generate_token,
+    get_real_lan_ip, is_valid_token,
+)
 
-def run_tests():
-    print("=" * 60)
-    print("🧪 LAN Subscription & Firewall Real-world Verification")
-    print("=" * 60)
+FAILS = []
 
-    # 1. Test LAN IP detection
-    lan_ip = get_real_lan_ip()
-    print(f"1. Detected Physical LAN IP: {lan_ip}")
-    assert lan_ip != "127.0.0.1", f"Expected real LAN IP, got {lan_ip}"
-    assert not lan_ip.startswith("198.18."), f"TUN IP was not filtered: {lan_ip}"
-    assert not lan_ip.startswith("169.254."), f"APIPA IP was not filtered: {lan_ip}"
-    print("   ✅ IP resolution passed (physical interface detected)")
 
-    cfg = load_config()
-    port = int(cfg.get("lan_server_port", 8686))
+def check(name: str, ok: bool, detail: str = ""):
+    print(("  ✅ " if ok else "  ❌ ") + name + (f"  [{detail}]" if detail else ""))
+    if not ok:
+        FAILS.append(name)
 
-    # 2. Test Firewall Rule
-    print("\n2. Testing Windows Firewall Rule:")
-    fw_ok = ensure_firewall_rule(port)
-    print(f"   ensure_firewall_rule({port}) -> {fw_ok}")
-    assert fw_ok, "Firewall rule creation failed!"
 
-    res = subprocess.run(
-        ["netsh", "advfirewall", "firewall", "show", "rule", "name=CF-FlClash-LAN-Sub"],
-        capture_output=True,
-        encoding="gbk",
-        errors="ignore",
-    )
-    print("   Firewall Rule Details:")
-    for line in res.stdout.splitlines():
-        if any(k in line for k in ["规则名称", "已启用", "方向", "操作", "协议", "本地端口", "配置文件", "Rule Name", "Enabled", "Direction", "Action", "Protocol", "LocalPort", "Profiles"]):
-            print(f"     {line.strip()}")
-    assert res.returncode == 0, "Firewall rule does not exist in netsh output!"
-    print("   ✅ Windows Firewall rule verified")
+def free_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
-    # 3. Start Server
-    print(f"\n3. Starting LANServerWorker on 0.0.0.0:{port}...")
-    pm = ProfileManager(cfg["flclash_profile_path"], BACKUPS_DIR, cfg["cf_node_names"],
-                        options=cfg)
 
-    server_worker = LANServerWorker(EXPORTS_DIR, port, profile_mgr=pm,
-                                    profile_path=cfg["flclash_profile_path"],
-                                    port_fallback=5)
-    server_worker.start()
-    time.sleep(1.5)  # Wait for socket to bind / export refresh
+DUMMY_UUID = "00000000-0000-4000-8000-000000000000"
+VLESS_LINK = (
+    f"vless://{DUMMY_UUID}@203.0.113.10:443?encryption=none&security=tls"
+    "&sni=test.example&type=ws&host=test.example&path=%2F&mux=0"
+    "&packetEncoding=xudp#TEST-NODE"
+)
+SYNTHETIC_YAML = (
+    "mixed-port: 7890\n"
+    "proxies:\n"
+    "  - name: TEST-NODE\n"
+    "    type: vless\n"
+    "    server: 203.0.113.10\n"
+    "    port: 443\n"
+    f"    uuid: {DUMMY_UUID}\n"
+    "    tls: true\n"
+    "    servername: test.example\n"
+    "    network: ws\n"
+)
 
-    actual_port = server_worker.actual_port or port
-    base_url = f"http://{lan_ip}:{actual_port}"
-    print(f"   Server active at: {base_url}")
 
-    # 4. Test HEAD /ios.yaml
-    print(f"\n4. Testing HEAD {base_url}/ios.yaml:")
-    resp_head = requests.head(f"{base_url}/ios.yaml", timeout=5)
-    print(f"   Status: {resp_head.status_code}")
-    print(f"   Headers: {dict(resp_head.headers)}")
-    assert resp_head.status_code == 200, f"Expected 200, got {resp_head.status_code}"
-    assert len(resp_head.content) == 0, f"HEAD response must have zero body, got {len(resp_head.content)} bytes"
-    assert "Content-Length" in resp_head.headers, "Missing Content-Length in HEAD response"
-    content_len = int(resp_head.headers["Content-Length"])
-    assert content_len > 0, f"Content-Length must be > 0, got {content_len}"
-    assert "yaml" in resp_head.headers.get("Content-Type", ""), "Content-Type must contain yaml"
-    assert "CF-Optimized.yaml" in resp_head.headers.get("Content-Disposition", ""), "Missing Content-Disposition"
-    assert resp_head.headers.get("Profile-Update-Interval") == "24", "Missing Profile-Update-Interval: 24"
-    assert resp_head.headers.get("Access-Control-Allow-Origin") == "*", "Missing CORS header"
-    print(f"   ✅ HEAD /ios.yaml passed (Content-Length: {content_len})")
+def make_exports(tmp: str) -> str:
+    exports = os.path.join(tmp, "exports")
+    os.makedirs(exports, exist_ok=True)
+    files = {
+        "FlClash_Optimized.yaml": SYNTHETIC_YAML,
+        "iOS_Clash_Config.yaml": SYNTHETIC_YAML,
+        "tv_happ.txt": (
+            "#subscription-auto-update-open-enable: 1\n"
+            "#subscription-autoconnect: 1\n"
+            "#subscription-autoconnect-type: lowestdelay\n" + VLESS_LINK + "\n"
+        ),
+        "happ_xray.json": json.dumps({
+            "dns": {"queryStrategy": "UseIPv4"},
+            "outbounds": [{"protocol": "vless", "tag": "cf-test", "settings": {
+                "vnext": [{"address": "203.0.113.10", "port": 443,
+                           "users": [{"id": DUMMY_UUID, "encryption": "none"}]}]},
+                "mux": {"enabled": False}}],
+            "routing": {"rules": []},
+        }),
+        "TV_VLESS_Links.txt": VLESS_LINK + "\n",
+        "tv_sub.txt": base64.b64encode((VLESS_LINK + "\n").encode()).decode(),
+    }
+    for name, text in files.items():
+        with open(os.path.join(exports, name), "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    return exports
 
-    # 5. Test GET /ios.yaml
-    print(f"\n5. Testing GET {base_url}/ios.yaml:")
-    resp_get = requests.get(f"{base_url}/ios.yaml", timeout=5)
-    print(f"   Status: {resp_get.status_code}")
-    print(f"   Body Length: {len(resp_get.content)} bytes")
-    assert resp_get.status_code == 200
-    assert len(resp_get.content) == content_len, f"Body length {len(resp_get.content)} != Content-Length {content_len}"
-    assert b"proxies:" in resp_get.content, "Body does not contain 'proxies:' key"
-    print("   ✅ GET /ios.yaml passed (exact length matches HEAD)")
 
-    # 6. Test Alias /clash
-    print(f"\n6. Testing GET {base_url}/clash (alias):")
-    resp_clash = requests.get(f"{base_url}/clash", timeout=5)
-    assert resp_clash.status_code == 200
-    assert len(resp_clash.content) == content_len
-    print("   ✅ GET /clash alias passed")
+def wait_started(worker, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not worker.actual_port:
+        time.sleep(0.05)
+    return worker.actual_port
 
-    # 7. Test HEAD & GET /tv
-    print(f"\n7. Testing HEAD & GET {base_url}/tv:")
-    resp_tv_head = requests.head(f"{base_url}/tv", timeout=5)
-    assert resp_tv_head.status_code == 200
-    tv_len = int(resp_tv_head.headers.get("Content-Length", 0))
-    assert tv_len > 0
-    assert len(resp_tv_head.content) == 0
 
-    resp_tv = requests.get(f"{base_url}/tv", timeout=5)
-    assert resp_tv.status_code == 200
-    assert len(resp_tv.content) == tv_len
-    decoded_tv = base64.b64decode(resp_tv.text).decode("utf-8")
-    assert "vless://" in decoded_tv
-    print(f"   ✅ /tv passed (Length: {tv_len}, Decoded VLESS links present)")
+def main() -> int:
+    print("=" * 66)
+    print("🧪 LAN Subscription Server (Token auth) — synthetic-data verification")
+    print("=" * 66)
+    tmp = tempfile.mkdtemp(prefix="cffo-lan-real-")
+    token = generate_token()
+    exports = make_exports(tmp)
+    port = free_port()
 
-    # 8. Test HEAD & GET /vless
-    print(f"\n8. Testing HEAD & GET {base_url}/vless:")
-    resp_vless_head = requests.head(f"{base_url}/vless", timeout=5)
-    assert resp_vless_head.status_code == 200
-    vless_len = int(resp_vless_head.headers.get("Content-Length", 0))
-    assert vless_len > 0
-    assert len(resp_vless_head.content) == 0
+    print("\n1. Token / LAN IP helpers")
+    check("Token 长度 >= 43（>= 256 bit）", len(token) >= 43, str(len(token)))
+    check("Token 为 URL-safe 且校验通过", is_valid_token(token))
+    ip = get_real_lan_ip()
+    print(f"   detected LAN IP: {ip}")
+    check("IP 检测不为 TUN/APIPA", not ip.startswith(("198.18.", "169.254.")), ip)
 
-    resp_vless = requests.get(f"{base_url}/vless", timeout=5)
-    assert resp_vless.status_code == 200
-    assert len(resp_vless.content) == vless_len
-    assert resp_vless.text.count("vless://") >= 3
-    print(f"   ✅ /vless passed (Length: {vless_len}, 3 VLESS links present)")
+    print("\n2. Firewall dry-run (no system change)")
+    info = ensure_firewall_rule_detailed(59999, allow_uac=False, dry_run=True)
+    check("dry-run 状态为 missing", info.get("status") == "missing", str(info))
+    check("规则作用域固定为 LocalSubnet", info.get("remoteip") == "LocalSubnet")
+    check("规则配置固定为 private", info.get("profile") == "private")
 
-    # 8.5 Test Happ subscription + Xray JSON
-    print(f"\n8.5 Testing GET {base_url}/tv_happ.txt & /happ.json:")
-    resp_happ = requests.get(f"{base_url}/tv_happ.txt", timeout=5)
-    assert resp_happ.status_code == 200
-    assert "#subscription-autoconnect-type: lowestdelay" in resp_happ.text
-    assert "mux=0" in resp_happ.text
-    resp_json = requests.get(f"{base_url}/happ.json", timeout=5)
-    assert resp_json.status_code == 200
-    assert resp_json.json()["dns"]["queryStrategy"] == "UseIPv4"
-    print("   ✅ /tv_happ.txt 与 /happ.json passed")
+    print(f"\n3. Start server on 127.0.0.1:{port} (no firewall changes)")
+    worker = LANServerWorker(exports, port, profile_mgr=None, profile_factory=None,
+                             profile_path="", host="127.0.0.1", port_fallback=3,
+                             ensure_firewall=False, token_provider=lambda: token)
+    worker.start()
+    actual = wait_started(worker)
+    check("服务已监听", actual == port, str(actual))
+    root = f"http://127.0.0.1:{actual}"
+    base = f"{root}/s/{token}"
+    try:
+        print("\n4. Authentication")
+        unauth = requests.get(f"{root}/ios.yaml", timeout=5)
+        check("无 Token 旧路径 404", unauth.status_code == 404)
+        check("无 Token 不返回配置", "proxies:" not in unauth.text)
+        wrong_token = generate_token()
+        while wrong_token == token:
+            wrong_token = generate_token()
+        wrong = requests.get(f"{root}/s/{wrong_token}/ios.yaml", timeout=5)
+        check("错误 Token 404", wrong.status_code == 404 and "proxies:" not in wrong.text)
+        check("根仪表盘需要 Token", requests.get(f"{root}/", timeout=5).status_code == 404)
 
-    # 9. Test Root Dashboard /
-    print(f"\n9. Testing GET {base_url}/ (Root HTML dashboard):")
-    resp_root = requests.get(f"{base_url}/", timeout=5)
-    assert resp_root.status_code == 200
-    assert "text/html" in resp_root.headers.get("Content-Type", "")
-    assert "CF-FlClash-Optimizer" in resp_root.text
-    print("   ✅ GET / dashboard passed")
+        print("\n5. Four subscription formats")
+        for name, ctype in (("flclash.yaml", "yaml"), ("ios.yaml", "yaml"),
+                            ("tv_happ.txt", "text"), ("happ.json", "json")):
+            resp = requests.get(f"{base}/{name}", timeout=5)
+            check(f"GET /s/<token>/{name} 200", resp.status_code == 200)
+            check(f"{name} Content-Type 含 {ctype}", ctype in resp.headers.get("Content-Type", ""))
+        check("happ.json 可解析", requests.get(f"{base}/happ.json", timeout=5).json()
+              ["dns"]["queryStrategy"] == "UseIPv4")
+        check("tv_happ.txt 含 mux=0",
+              "mux=0" in requests.get(f"{base}/tv_happ.txt", timeout=5).text)
 
-    # 10. Test 404
-    print(f"\n10. Testing GET {base_url}/not_found:")
-    resp_404 = requests.get(f"{base_url}/not_found", timeout=5)
-    assert resp_404.status_code == 404
-    print("   ✅ 404 handler passed")
+        head = requests.head(f"{base}/ios.yaml", timeout=5)
+        check("HEAD 无 body 且有 Content-Length",
+              head.content == b"" and int(head.headers.get("Content-Length", 0)) > 0)
+        check("响应不含 CORS 通配符",
+              "Access-Control-Allow-Origin" not in head.headers)
+        check("响应带 nosniff", head.headers.get("X-Content-Type-Options") == "nosniff")
 
-    # Stop server
-    server_worker.stop()
-    print("\n" + "=" * 60)
-    print("🎉 ALL LAN SUBSCRIPTION & FIREWALL TESTS PASSED 100%!")
-    print("=" * 60)
+        print("\n6. Extra formats / dashboard / 404")
+        check("Base64 订阅可解码",
+              base64.b64decode(requests.get(f"{base}/tv", timeout=5).text).decode().count("vless://") >= 1)
+        check("VLESS 列表可读", requests.get(f"{base}/vless", timeout=5).text.count("vless://") >= 1)
+        dash = requests.get(f"{base}/", timeout=5)
+        check("Token 下仪表盘 200", dash.status_code == 200 and "tv_happ.txt" in dash.text)
+        check("Token 下未知端点 404",
+              requests.get(f"{base}/nope", timeout=5).status_code == 404)
+    finally:
+        worker.stop()
+    time.sleep(0.2)
+    try:
+        requests.get(f"{base}/ios.yaml", timeout=2)
+        down = False
+    except Exception:
+        down = True
+    check("stop() 后端口不可访问", down)
+
+    print("\n" + "=" * 66)
+    print(f"结果: {'全部通过' if not FAILS else str(len(FAILS)) + ' 项失败'}")
+    print("=" * 66)
+    return 0 if not FAILS else 1
+
 
 if __name__ == "__main__":
-    run_tests()
+    sys.exit(main())

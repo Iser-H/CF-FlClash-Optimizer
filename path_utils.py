@@ -97,8 +97,13 @@ def load_config() -> dict:
         "cfst_dn": 10,
         "cfst_url": "",
         "lan_server_port": 8686,
-        "lan_server_enabled": True,
-        "lan_bind_host": "0.0.0.0",
+        # LAN sharing is opt-in for a fresh install. An existing config.json
+        # that explicitly stores True keeps working, but now always requires
+        # the token below.
+        "lan_server_enabled": False,
+        "lan_bind_host": "auto",
+        "lan_auth_token": "",
+        "lan_firewall_remote": "LocalSubnet",
         "lan_port_fallback": 10,
         "airport_profile_name": "",
         "airport_profile_path": "",

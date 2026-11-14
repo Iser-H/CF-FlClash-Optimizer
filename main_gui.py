@@ -84,7 +84,10 @@ from clients import (
 )
 from export_dialog import ExportDialog
 from auto_guard import AutoGuardian
-from lan_server import ensure_firewall_rule_detailed, firewall_rule_name
+from lan_server import (
+    ensure_firewall_rule_detailed, firewall_rule_name,
+    ensure_lan_token, generate_token, is_valid_token,
+)
 from cidr_pool import (
     SubnetScoreStore, ensure_cidr_file, sample_candidates, select_top_ips, subnet_of,
 )
@@ -544,6 +547,8 @@ class MainWindow(QMainWindow):
         self._lan_server = None
         self._lan_ip = ""
         self._lan_port = self.cfg["lan_server_port"]
+        self._lan_base_url = ""
+        self._lan_urls = []
         self._auto_replace = False
         self._guard = None
         self._instance_server = None
@@ -570,11 +575,13 @@ class MainWindow(QMainWindow):
         self._sync_auto_start_from_registry()
 
         # Start LAN subscription service + auto guardian (daemon threads, never
-        # blocks the GUI thread).
-        if self.cfg.get("lan_server_enabled", True):
+        # blocks the GUI thread). LAN sharing is opt-in: only an explicit
+        # True saved by the user starts it, and a token is mandatory.
+        if self.cfg.get("lan_server_enabled", False):
             self._start_lan_server()
         else:
-            self.lan_info_lbl.setText("⏸ 局域网订阅服务已关闭（勾选上方开关可启用）")
+            self.lan_info_lbl.setText("⏸ 局域网订阅服务已关闭（默认关闭，勾选上方开关可启用）")
+        self._update_lan_auth_label()
         if self.cfg.get("auto_guard_enabled"):
             self.guard_chk.setChecked(True)
 
@@ -871,20 +878,43 @@ class MainWindow(QMainWindow):
 
         lan_row = QHBoxLayout()
         self.lan_chk = QCheckBox("启用局域网 HTTP 订阅服务")
-        self.lan_chk.setToolTip("手机 / 电视只添加一次局域网订阅链接，IP 更新后自动拉取最新配置")
-        self.lan_chk.setChecked(bool(self.cfg.get("lan_server_enabled", True)))
+        self.lan_chk.setToolTip(
+            "默认关闭。开启后每条订阅地址都带独立访问 Token；关闭服务或重新生成 Token 后，"
+            "旧地址立即失效。")
+        self.lan_chk.setChecked(bool(self.cfg.get("lan_server_enabled", False)))
         self.lan_chk.toggled.connect(self._toggle_lan_server)
         lan_row.addWidget(self.lan_chk)
 
         self.fw_btn = QPushButton("🛡️ 一键放行防火墙端口")
         self.fw_btn.setStyleSheet("padding: 4px; background: #455A64; color: white; border-radius: 4px;")
-        self.fw_btn.setToolTip("检查并添加 TCP 入站规则（必要时弹一次 UAC 提权）")
+        self.fw_btn.setToolTip(
+            "检查并添加 TCP 入站规则：仅专用网络 + 本地子网，必要时弹一次 UAC 提权")
         self.fw_btn.clicked.connect(self._open_firewall_port)
         lan_row.addWidget(self.fw_btn)
+
+        self.rotate_token_btn = QPushButton("🔄 重新生成 Token")
+        self.rotate_token_btn.setStyleSheet("padding: 4px; background: #6A1B9A; color: white; border-radius: 4px;")
+        self.rotate_token_btn.setToolTip(
+            "立即轮换访问令牌：所有设备上的旧订阅地址马上失效，需要重新复制新链接")
+        self.rotate_token_btn.clicked.connect(self._rotate_lan_token)
+        lan_row.addWidget(self.rotate_token_btn)
+
+        self.copy_lan_btn = QPushButton("📋 复制订阅链接")
+        self.copy_lan_btn.setStyleSheet("padding: 4px; background: #1565C0; color: white; border-radius: 4px;")
+        self.copy_lan_btn.setToolTip("复制 4 条带 Token 的订阅地址（FlClash / iOS / Happ / Happ JSON）")
+        self.copy_lan_btn.setEnabled(False)
+        self.copy_lan_btn.clicked.connect(self._copy_lan_links)
+        lan_row.addWidget(self.copy_lan_btn)
         lan_row.addStretch()
         bottom_outer.addLayout(lan_row)
 
-        self.firewall_lbl = QLabel("🛡️ 防火墙规则检查中...")
+        self.lan_auth_lbl = QLabel("🔐 访问认证：未启用（开启服务时自动生成高强度 Token）")
+        self.lan_auth_lbl.setStyleSheet("font-size: 11px; color: #6A1B9A; padding: 2px;")
+        self.lan_auth_lbl.setWordWrap(True)
+        self.lan_auth_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bottom_outer.addWidget(self.lan_auth_lbl)
+
+        self.firewall_lbl = QLabel("🛡️ 防火墙规则：未检查（服务未启用）")
         self.firewall_lbl.setStyleSheet("font-size: 11px; color: #37474F; padding: 2px;")
         self.firewall_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         bottom_outer.addWidget(self.firewall_lbl)
@@ -1245,8 +1275,18 @@ class MainWindow(QMainWindow):
         return ProfileManager(self.profile_path, BACKUPS_DIR,
                               self.cfg["cf_node_names"], options=self.cfg)
 
+    def _ensure_lan_access_token(self) -> str:
+        """Load or create the 384-bit LAN access token (persisted)."""
+        return ensure_lan_token(self.cfg, save_config)
+
     def _start_lan_server(self):
-        """Start the LAN HTTP subscription service on a daemon thread."""
+        """Start the token-protected LAN HTTP subscription service."""
+        if self._lan_server is not None:
+            return
+        token = self._ensure_lan_access_token()
+        if not is_valid_token(token):
+            self._on_lan_error("访问 Token 未初始化，服务未启动")
+            return
         try:
             self._regenerate_exports(silent=True)
         except Exception as exc:
@@ -1255,15 +1295,24 @@ class MainWindow(QMainWindow):
             EXPORTS_DIR, self._lan_port, profile_mgr=None,
             profile_factory=self._profile_factory,
             profile_path=self.profile_path,
-            host=self.cfg.get("lan_bind_host", "0.0.0.0"),
+            host=self.cfg.get("lan_bind_host") or "auto",
             port_fallback=int(self.cfg.get("lan_port_fallback", 10) or 0),
             ensure_firewall=True,
+            token_provider=lambda: self.cfg.get("lan_auth_token", ""),
+            remote_scope=self.cfg.get("lan_firewall_remote", "LocalSubnet"),
         )
         self._lan_server.started.connect(self._on_lan_started)
         self._lan_server.warning.connect(lambda msg: self.statusBar().showMessage(msg))
         self._lan_server.firewall.connect(self._on_firewall_status)
         self._lan_server.error.connect(self._on_lan_error)
         self._lan_server.start()
+        if hasattr(self, "firewall_lbl"):
+            self.firewall_lbl.setText("🛡️ 防火墙规则检查中...")
+        if hasattr(self, "lan_info_lbl"):
+            self.lan_info_lbl.setText("🌐 局域网订阅服务启动中…（Token 认证已启用）")
+        if hasattr(self, "copy_lan_btn"):
+            self.copy_lan_btn.setEnabled(False)
+        self._update_lan_auth_label()
 
     def _regenerate_exports(self, silent: bool = False):
         """Regenerate every multi-end export file from the current profile."""
@@ -1272,18 +1321,51 @@ class MainWindow(QMainWindow):
             self.log_text.appendPlainText("📲 已重新生成 iOS / Happ / Base64 订阅文件")
         return paths
 
+    def _lan_is_running(self) -> bool:
+        return (self._lan_server is not None
+                and bool(getattr(self._lan_server, "actual_port", 0)))
+
+    def _refresh_lan_urls(self):
+        """Build the four token-bearing subscription URLs (kept out of logs)."""
+        token = str(self.cfg.get("lan_auth_token") or "")
+        if not self._lan_base_url or not is_valid_token(token):
+            self._lan_urls = []
+            return
+        base = f"{self._lan_base_url}/s/{token}"
+        self._lan_urls = [f"{base}/{name}" for name in
+                          ("flclash.yaml", "ios.yaml", "tv_happ.txt", "happ.json")]
+
+    def _update_lan_auth_label(self):
+        if not hasattr(self, "lan_auth_lbl"):
+            return
+        token = self.cfg.get("lan_auth_token", "")
+        if not is_valid_token(token):
+            text = "🔐 访问认证：未启用（开启服务时自动生成高强度 Token）"
+        elif self._lan_is_running():
+            text = "🔐 访问认证：已启用 · 订阅地址必须携带 Token，未认证请求无法获取配置"
+        else:
+            text = "🔐 访问认证：Token 已保存 · 服务关闭时订阅地址不可访问"
+        self.lan_auth_lbl.setText(text)
+
     def _on_lan_started(self, ip: str, port: int):
         self._lan_ip = ip
         self._lan_port = int(port)
-        urls = (f"http://{ip}:{port}/ios.yaml  ·  "
-                f"http://{ip}:{port}/tv_happ.txt  ·  "
-                f"http://{ip}:{port}/happ.json")
-        text = f"🌐 局域网订阅就绪: {urls}"
+        self._lan_base_url = f"http://{ip}:{port}"
+        self._refresh_lan_urls()
+        masked = (f"{self._lan_base_url}/s/••••••••/ios.yaml  ·  "
+                  f"{self._lan_base_url}/s/••••••••/tv_happ.txt  ·  "
+                  f"{self._lan_base_url}/s/••••••••/happ.json")
+        text = (f"🌐 局域网订阅就绪: {masked}"
+                f"（🔐 Token 认证，点击「复制订阅链接」获取完整地址）")
         if hasattr(self, "lan_info_lbl"):
             self.lan_info_lbl.setText(text)
-        self.statusBar().showMessage(f"局域网订阅服务运行中: http://{ip}:{port}/ios.yaml")
+        self.statusBar().showMessage(
+            f"局域网订阅服务运行中: http://{ip}:{port}/s/…/ios.yaml（Token 认证）")
         if hasattr(self, "log_text"):
             self.log_text.appendPlainText(text)
+        if hasattr(self, "copy_lan_btn"):
+            self.copy_lan_btn.setEnabled(bool(self._lan_urls))
+        self._update_lan_auth_label()
 
     def _stop_lan_server(self):
         if self._lan_server is not None:
@@ -1292,8 +1374,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._lan_server = None
+        self._lan_base_url = ""
+        self._lan_urls = []
+        if hasattr(self, "copy_lan_btn"):
+            self.copy_lan_btn.setEnabled(False)
         if hasattr(self, "lan_info_lbl"):
-            self.lan_info_lbl.setText("⏸ 局域网订阅服务已关闭")
+            self.lan_info_lbl.setText("⏸ 局域网订阅服务已关闭（订阅地址当前不可访问）")
+        if hasattr(self, "firewall_lbl"):
+            self.firewall_lbl.setText("🛡️ 服务已关闭，未开放端口")
+        self._update_lan_auth_label()
 
     def _toggle_lan_server(self, enabled: bool):
         self.cfg["lan_server_enabled"] = bool(enabled)
@@ -1308,6 +1397,41 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("局域网订阅服务已关闭")
         self._sync_tray_menu()
 
+    def _copy_lan_links(self):
+        if not self._lan_urls:
+            self.statusBar().showMessage("请先启用局域网订阅服务，再复制订阅链接")
+            return
+        QApplication.clipboard().setText("\n".join(self._lan_urls))
+        self.statusBar().showMessage("已复制 4 条带 Token 的订阅链接（请勿公开分享）")
+
+    def _rotate_lan_token(self):
+        answer = QMessageBox.question(
+            self, "重新生成访问 Token",
+            "重新生成后，所有设备上保存的旧订阅地址会立即失效，需要重新添加订阅。\n\n继续吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self.cfg["lan_auth_token"] = generate_token()
+        try:
+            save_config(self.cfg)
+        except Exception as exc:
+            self.statusBar().showMessage(f"⚠ Token 保存失败: {exc}")
+            return
+        if self._lan_is_running():
+            # The handler reads the token through a live provider: old links
+            # stop working on the very next request, no restart needed.
+            self._refresh_lan_urls()
+            self._on_lan_started(self._lan_ip, self._lan_port)
+        else:
+            self._lan_urls = []
+            self._update_lan_auth_label()
+            if hasattr(self, "copy_lan_btn"):
+                self.copy_lan_btn.setEnabled(False)
+        QMessageBox.information(
+            self, "Token 已更新",
+            "新的访问 Token 已生成并立即生效。\n"
+            "旧订阅地址不再返回任何配置，请重新复制链接到各设备。")
+
     def _on_firewall_status(self, message: str):
         if hasattr(self, "firewall_lbl"):
             self.firewall_lbl.setText(f"🛡️ {message}")
@@ -1318,23 +1442,32 @@ class MainWindow(QMainWindow):
     def _open_firewall_port(self):
         """One-click: check/add the inbound TCP rule for the LAN port."""
         port = int(self._lan_port or self.cfg.get("lan_server_port", 8686))
-        info = ensure_firewall_rule_detailed(port, allow_uac=True)
+        remote = self.cfg.get("lan_firewall_remote", "LocalSubnet")
+        info = ensure_firewall_rule_detailed(port, allow_uac=True, remote_ip=remote)
         self._on_firewall_status(f"{info.get('rule')}: {info.get('status')} — {info.get('detail')}")
-        icon = "✅" if info.get("status") in ("exists", "added", "added_uac") else "⚠"
+        icon = "✅" if info.get("status") in (
+            "exists", "exists_unhardened", "added", "added_uac") else "⚠"
         QMessageBox.information(
             self, "防火墙端口放行",
             f"{icon} 端口: {port}\n"
             f"规则名: {info.get('rule')}\n"
             f"状态: {info.get('status')}\n"
+            f"作用域: 专用网络 / {info.get('remoteip', remote)}\n"
             f"详情: {info.get('detail')}\n\n"
             f"手动命令（管理员 CMD）:\n"
             f"netsh advfirewall firewall add rule name=\"{firewall_rule_name(port)}\" "
-            f"dir=in action=allow protocol=TCP localport={port}",
+            f"dir=in action=allow protocol=TCP localport={port} "
+            f"profile=private remoteip={info.get('remoteip', remote)}",
         )
 
     def _on_lan_error(self, msg: str):
+        self._lan_base_url = ""
+        self._lan_urls = []
+        if hasattr(self, "copy_lan_btn"):
+            self.copy_lan_btn.setEnabled(False)
         if hasattr(self, "lan_info_lbl"):
             self.lan_info_lbl.setText(f"⚠ 局域网订阅服务异常: {msg}")
+        self._update_lan_auth_label()
         self.statusBar().showMessage(f"局域网订阅服务错误: {msg}")
 
     # ── Background auto guardian ──────────────────────────────
