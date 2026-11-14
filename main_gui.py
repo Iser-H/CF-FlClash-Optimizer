@@ -56,8 +56,9 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPlainTextEdit, QHeaderView,
     QComboBox, QProgressBar, QSplitter, QCheckBox, QMessageBox,
     QFrame, QMenu, QSystemTrayIcon, QFileDialog,
+    QScrollArea, QSizePolicy, QToolButton,
 )
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QObject, Signal
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QObject, Signal, QSize
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QFont, QColor, QIcon, QPixmap, QPainter, QBrush, QPen,
@@ -288,6 +289,8 @@ class NodeCard(QFrame):
         self.current_speed = 0.0
 
         self.setFrameShape(QFrame.StyledPanel)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setMinimumWidth(230)
         self.setStyleSheet("""
             NodeCard {
                 border: 2px solid #ccc; border-radius: 10px;
@@ -381,6 +384,78 @@ class NodeCard(QFrame):
             self.target_chk.setStyleSheet("font-size: 11px; color: #C62828; font-weight: bold;")
 
 
+class CollapsibleSection(QWidget):
+    """Compact panel for low-frequency settings (looks like a QGroupBox).
+
+    The body is hidden while collapsed, so a panel added later cannot squeeze
+    the primary work area. Callers use ``section.body_layout`` exactly like a
+    QGroupBox layout, therefore no widget or signal/slot wiring has to change.
+    """
+
+    def __init__(self, title: str, expanded: bool = True, parent=None):
+        super().__init__(parent)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._header = QFrame()
+        self._header.setObjectName("collapsibleHeader")
+        self._header.setStyleSheet(
+            "#collapsibleHeader { background: #ECEFF1; border: 1px solid #CFD8DC;"
+            " border-radius: 4px; }")
+        header_layout = QHBoxLayout(self._header)
+        header_layout.setContentsMargins(6, 2, 8, 2)
+        header_layout.setSpacing(6)
+
+        self._toggle_btn = QToolButton()
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setChecked(bool(expanded))
+        self._toggle_btn.setAutoRaise(True)
+        self._toggle_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._toggle_btn.setText(title)
+        self._toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._toggle_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._toggle_btn.setStyleSheet(
+            "QToolButton { border: none; background: transparent; text-align: left;"
+            " font-weight: bold; font-size: 12px; color: #263238; padding: 4px 2px; }")
+        header_layout.addWidget(self._toggle_btn, 1)
+
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("font-size: 11px; color: #607D8B; background: transparent;")
+        self._summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        header_layout.addWidget(self._summary, 0)
+        root.addWidget(self._header)
+
+        self.body = QFrame()
+        self.body.setObjectName("collapsibleBody")
+        self.body.setStyleSheet(
+            "#collapsibleBody { background: transparent; border: 1px solid #CFD8DC;"
+            " border-top: none; border-radius: 0 0 4px 4px; }")
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(10, 8, 10, 10)
+        self.body_layout.setSpacing(6)
+        self.body.setVisible(bool(expanded))
+        root.addWidget(self.body)
+
+        self._toggle_btn.toggled.connect(self._on_toggled)
+
+    def _on_toggled(self, expanded: bool):
+        self.body.setVisible(expanded)
+        self._toggle_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+
+    def is_expanded(self) -> bool:
+        return self._toggle_btn.isChecked()
+
+    def set_expanded(self, expanded: bool):
+        self._toggle_btn.setChecked(bool(expanded))
+
+    def set_summary(self, text: str):
+        """One-line status shown in the header while the body is collapsed."""
+        self._summary.setText(text or "")
+
+
 def order_for_subnet_diversity(ips: list) -> list:
     """Reorder IPs so distinct /24 subnets come first (never drops an IP)."""
     ordered, deferred, seen = [], [], set()
@@ -401,7 +476,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CF-FlClash-Optimizer — Cloudflare 优选 IP 体检与多端配置导出")
-        self.setMinimumSize(1100, 750)
+        # The tab scrolls when space runs out, so the hard minimum only has to
+        # fit a 1920x1080 panel at 150 % scaling; the default size is capped by
+        # the current screen's work area (DPI aware) instead of overflowing it.
+        self.setMinimumSize(980, 640)
+        self.resize(self._preferred_window_size())
 
         # Tray / shutdown state — created before any UI so closeEvent is always safe.
         self._force_quit = False          # set by the tray "完全退出程序" action
@@ -515,35 +594,72 @@ class MainWindow(QMainWindow):
             return found["path"]
         return configured
 
+    @staticmethod
+    def _preferred_window_size() -> QSize:
+        """Default size capped by the screen work area (DPI scaled)."""
+        width, height = 1180, 1000
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            width = max(980, min(width, avail.width() - 40))
+            height = max(640, min(height, avail.height() - 48))
+        return QSize(width, height)
+
     def _build_tab1(self) -> QWidget:
+        """Single workflow tab: health check → speed test → write / export.
+
+        v1.1 layout rules:
+        * the tab content sits in a QScrollArea, so a small window or 125/150 %
+          DPI scaling scrolls instead of squeezing every control;
+        * the speed-test area keeps the vertical stretch and a real minimum
+          height, so the table and log stay readable;
+        * the client panel and the startup panel are collapsible and start
+          closed; their widgets and signal/slot wiring are unchanged.
+        """
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setSpacing(6)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.main_scroll = QScrollArea()
+        self.main_scroll.setWidgetResizable(True)
+        self.main_scroll.setFrameShape(QFrame.NoFrame)
+        self.main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer.addWidget(self.main_scroll)
+
+        content = QWidget()
+        self.main_scroll.setWidget(content)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
         # ── Section 1: Health Check Dashboard ─────────────────
         health_group = QGroupBox("📊 已配置 IP 深度体检看板")
         health_layout = QVBoxLayout(health_group)
+        health_layout.setSpacing(4)
 
-        # Node cards
         cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(8)
         self.node_cards = []
         for i in range(3):
             card = NodeCard(node_index=i)
             self.node_cards.append(card)
-            cards_layout.addWidget(card)
+            cards_layout.addWidget(card, 1)
         health_layout.addLayout(cards_layout)
 
-        # Health check button
         self.health_btn = QPushButton("🩺 一键检测当前已配置 IP 速度与延迟 (内核路由直连探测)")
-        self.health_btn.setStyleSheet("font-size: 14px; padding: 8px; background: #2196F3; color: white; border-radius: 5px;")
+        self.health_btn.setStyleSheet(
+            "font-size: 14px; padding: 8px; background: #2196F3; color: white; border-radius: 5px;")
+        self.health_btn.setMinimumHeight(38)
         self.health_btn.clicked.connect(self._run_health_check)
         health_layout.addWidget(self.health_btn)
 
-        layout.addWidget(health_group)
+        layout.addWidget(health_group, 0)
 
-        # ── Section 1.5: Background auto guardian ─────────────
+        # ── Section 2: Auto guardian (compact, always visible) ─
         guard_group = QGroupBox("🛡️ 后台自动巡检与劣化自动换 IP")
         guard_layout = QVBoxLayout(guard_group)
+        guard_layout.setSpacing(4)
 
         guard_row = QHBoxLayout()
         self.guard_chk = QCheckBox("开启后台自动巡检（每")
@@ -572,222 +688,164 @@ class MainWindow(QMainWindow):
         self.guard_chk.toggled.connect(self._toggle_auto_guard)
         self.guard_interval_spin.valueChanged.connect(self._on_guard_interval_changed)
 
-        layout.addWidget(guard_group)
+        layout.addWidget(guard_group, 0)
 
-        # ── Section 1.6: Startup & close behaviour ────────────
-        startup_group = QGroupBox("🖥️ 启动与关闭行为（系统托盘 / 开机自启）")
-        startup_layout = QVBoxLayout(startup_group)
-
-        self.close_to_tray_chk = QCheckBox("关闭窗口时最小化到系统托盘（保持后台巡检）")
-        self.close_to_tray_chk.setStyleSheet("font-weight: bold; color: #00695C;")
-        self.close_to_tray_chk.setToolTip(
-            "勾选后点击右上角 × 只会隐藏到右下角托盘，后台自动巡检与局域网订阅服务继续运行；\n"
-            "在托盘菜单选择「❌ 完全退出程序」才会真正停止全部后台服务。")
-        self.close_to_tray_chk.setChecked(bool(self.cfg.get("close_to_tray", True)))
-        self.close_to_tray_chk.toggled.connect(self._toggle_close_to_tray)
-        startup_layout.addWidget(self.close_to_tray_chk)
-
-        self.auto_start_chk = QCheckBox("开机自动启动（静默缩至右下角托盘）")
-        self.auto_start_chk.setStyleSheet("font-weight: bold; color: #1565C0;")
-        self.auto_start_chk.setToolTip(
-            "写入当前用户注册表 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run，\n"
-            "登录后以 --minimized 参数静默启动，无需管理员权限。")
-        self.auto_start_chk.toggled.connect(self._toggle_auto_start)
-        startup_layout.addWidget(self.auto_start_chk)
-
-        self.auto_start_lbl = QLabel("")
-        self.auto_start_lbl.setStyleSheet("font-size: 11px; color: #555;")
-        self.auto_start_lbl.setWordWrap(True)
-        self.auto_start_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        startup_layout.addWidget(self.auto_start_lbl)
-
-        layout.addWidget(startup_group)
-
-        # ── Section 1.7: Client & profile (FlClash / Verge / Mihomo) ──
-        client_group = QGroupBox(
-            "🔌 客户端与配置文件（FlClash / Clash Verge Rev / Mihomo Party / 任意本地 YAML）")
-        client_layout = QVBoxLayout(client_group)
-
-        client_row = QHBoxLayout()
-        client_row.addWidget(QLabel("客户端:"))
-        self.client_combo = QComboBox()
-        self.client_combo.addItem("自动检测（推荐）", "auto")
-        for key, label in CLIENT_LABELS.items():
-            if key == "manual":
-                continue
-            self.client_combo.addItem(label, key)
-        self.client_combo.addItem("手动选择 YAML…", "manual")
-        self.client_combo.currentIndexChanged.connect(self._on_client_changed)
-        client_row.addWidget(self.client_combo)
-
-        self.client_rescan_btn = QPushButton("🔄 重新扫描")
-        self.client_rescan_btn.setStyleSheet("padding: 4px;")
-        self.client_rescan_btn.setToolTip("重新扫描本机 FlClash / Clash Verge Rev / Mihomo Party 的配置目录")
-        self.client_rescan_btn.clicked.connect(lambda: self._refresh_client_choices(refresh=True))
-        client_row.addWidget(self.client_rescan_btn)
-        client_row.addStretch()
-        client_layout.addLayout(client_row)
-
-        profile_row = QHBoxLayout()
-        profile_row.addWidget(QLabel("配置:"))
-        self.profile_combo = QComboBox()
-        self.profile_combo.setMinimumWidth(380)
-        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
-        profile_row.addWidget(self.profile_combo, 1)
-        self.browse_btn = QPushButton("📂 浏览…")
-        self.browse_btn.setStyleSheet("padding: 4px;")
-        self.browse_btn.clicked.connect(self._browse_profile)
-        profile_row.addWidget(self.browse_btn)
-        client_layout.addLayout(profile_row)
-
-        path_row = QHBoxLayout()
-        path_row.addWidget(QLabel("YAML 路径:"))
-        self.client_path_edit = QLineEdit(self.profile_path or "")
-        self.client_path_edit.setPlaceholderText("选择任意本地 Clash / Mihomo YAML 配置文件")
-        path_row.addWidget(self.client_path_edit, 1)
-        client_layout.addLayout(path_row)
-
-        api_row = QHBoxLayout()
-        api_row.addWidget(QLabel("外部控制 API:"))
-        self.api_url_edit = QLineEdit(self.cfg.get("external_controller", "127.0.0.1:9090"))
-        self.api_url_edit.setPlaceholderText("127.0.0.1:9090")
-        self.api_url_edit.setMaximumWidth(200)
-        api_row.addWidget(self.api_url_edit)
-
-        api_row.addWidget(QLabel("Secret:"))
-        self.api_secret_edit = QLineEdit(self.cfg.get("secret", ""))
-        self.api_secret_edit.setPlaceholderText("留空表示无密钥")
-        self.api_secret_edit.setMaximumWidth(220)
-        api_row.addWidget(self.api_secret_edit)
-
-        self.api_test_btn = QPushButton("🔌 测试连接")
-        self.api_test_btn.setStyleSheet("padding: 4px;")
-        self.api_test_btn.clicked.connect(self._test_clash_api)
-        api_row.addWidget(self.api_test_btn)
-
-        self.client_apply_btn = QPushButton("✅ 应用配置")
-        self.client_apply_btn.setStyleSheet(
-            "padding: 5px 12px; background: #1565C0; color: white; border-radius: 4px; font-weight: bold;")
-        self.client_apply_btn.clicked.connect(self._apply_client_settings)
-        api_row.addWidget(self.client_apply_btn)
-        api_row.addStretch()
-        client_layout.addLayout(api_row)
-
-        self.client_status_lbl = QLabel("")
-        self.client_status_lbl.setStyleSheet("font-size: 11px; color: #555;")
-        self.client_status_lbl.setWordWrap(True)
-        self.client_status_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        client_layout.addWidget(self.client_status_lbl)
-
-        layout.addWidget(client_group)
-        self._refresh_client_choices()
-
-        # ── Section 2: Full Speed Test ────────────────────────
+        # ── Section 3: Full speed test (primary work area) ────
         speed_group = QGroupBox("🚀 全网优选测速")
         speed_layout = QVBoxLayout(speed_group)
+        speed_layout.setSpacing(4)
 
-        # Parameters row
-        params = QHBoxLayout()
-        params.addWidget(QLabel("并发线程:"))
+        # Two balanced parameter rows instead of seven widgets on one line:
+        # labels cannot be truncated at 125 % DPI or on a narrow window.
+        params = QGridLayout()
+        params.setHorizontalSpacing(8)
+        params.setVerticalSpacing(6)
+
+        params.addWidget(QLabel("并发线程:"), 0, 0)
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 500)
         self.threads_spin.setValue(self.cfg.get("cfst_threads", 200))
-        params.addWidget(self.threads_spin)
+        self.threads_spin.setMinimumWidth(78)
+        params.addWidget(self.threads_spin, 0, 1)
 
-        params.addWidget(QLabel("延迟上限(ms):"))
+        params.addWidget(QLabel("延迟上限(ms):"), 0, 2)
         self.tl_spin = QSpinBox()
         self.tl_spin.setRange(100, 2000)
         self.tl_spin.setValue(self.cfg.get("cfst_tl", 400))
-        params.addWidget(self.tl_spin)
+        self.tl_spin.setMinimumWidth(78)
+        params.addWidget(self.tl_spin, 0, 3)
 
-        params.addWidget(QLabel("速度过滤下限(MB/s):"))
+        params.addWidget(QLabel("速度过滤下限(MB/s):"), 0, 4)
         self.sl_spin = QDoubleSpinBox()
         self.sl_spin.setRange(0, 100)
         self.sl_spin.setValue(float(self.cfg.get("cfst_sl", 5.0)))
         self.sl_spin.setSingleStep(0.5)
-        params.addWidget(self.sl_spin)
+        self.sl_spin.setMinimumWidth(78)
+        params.addWidget(self.sl_spin, 0, 5)
 
-        params.addWidget(QLabel("测速数量:"))
+        params.addWidget(QLabel("测速数量:"), 1, 0)
         self.dn_spin = QSpinBox()
         self.dn_spin.setRange(1, 50)
         self.dn_spin.setValue(self.cfg.get("cfst_dn", 10))
-        params.addWidget(self.dn_spin)
+        self.dn_spin.setMinimumWidth(78)
+        params.addWidget(self.dn_spin, 1, 1)
 
-        params.addWidget(QLabel("自定义URL:"))
+        params.addWidget(QLabel("自定义URL:"), 1, 2)
         self.url_edit = QLineEdit(self.cfg.get("cfst_url", ""))
         self.url_edit.setPlaceholderText("留空使用默认CF测速源")
-        params.addWidget(self.url_edit)
+        self.url_edit.setMinimumWidth(200)
+        params.addWidget(self.url_edit, 1, 3, 1, 3)
+        params.setColumnStretch(3, 1)
         speed_layout.addLayout(params)
 
         # Action buttons
         btns = QHBoxLayout()
+        btns.setSpacing(8)
         self.auto_btn = QPushButton("🚀 全网优选并智能替换 (保优防降级)")
-        self.auto_btn.setStyleSheet("font-size: 13px; padding: 6px; background: #4CAF50; color: white; border-radius: 4px;")
+        self.auto_btn.setStyleSheet(
+            "font-size: 13px; padding: 6px; background: #4CAF50; color: white; border-radius: 4px;")
+        self.auto_btn.setMinimumHeight(34)
         self.auto_btn.clicked.connect(lambda: self._run_speed_test(auto_replace=True))
-        btns.addWidget(self.auto_btn)
+        btns.addWidget(self.auto_btn, 1)
 
         self.manual_btn = QPushButton("🔍 仅全网测速（手动勾选）")
-        self.manual_btn.setStyleSheet("font-size: 13px; padding: 6px; background: #FF9800; color: white; border-radius: 4px;")
+        self.manual_btn.setStyleSheet(
+            "font-size: 13px; padding: 6px; background: #FF9800; color: white; border-radius: 4px;")
+        self.manual_btn.setMinimumHeight(34)
         self.manual_btn.clicked.connect(lambda: self._run_speed_test(auto_replace=False))
-        btns.addWidget(self.manual_btn)
+        btns.addWidget(self.manual_btn, 1)
 
         self.stop_btn = QPushButton("⏹️ 停止任务")
-        self.stop_btn.setStyleSheet("font-size: 13px; padding: 6px; background: #f44336; color: white; border-radius: 4px;")
+        self.stop_btn.setStyleSheet(
+            "font-size: 13px; padding: 6px; background: #f44336; color: white; border-radius: 4px;")
+        self.stop_btn.setMinimumHeight(34)
         self.stop_btn.clicked.connect(self._stop_speed_test)
         self.stop_btn.setEnabled(False)
-        btns.addWidget(self.stop_btn)
+        btns.addWidget(self.stop_btn, 1)
         speed_layout.addLayout(btns)
 
-        # Splitter: table + log
+        # Splitter: table + log. Minimum sizes keep both panes usable; the
+        # stretch factor lets the speed group absorb spare window height.
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
 
         self.result_table = QTableWidget(0, 7)
-        self.result_table.setHorizontalHeaderLabels(["✓ 勾选", "排名", "IP 地址", "丢包率", "平均延迟(ms)", "下载速度(MB/s)", "达标状态"])
-        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.result_table.setHorizontalHeaderLabels(
+            ["✓ 勾选", "排名", "IP 地址", "丢包率", "平均延迟(ms)", "下载速度(MB/s)", "达标状态"])
+        # Content-sized sections (last one stretches) keep every header label
+        # readable; the table itself scrolls horizontally when very narrow.
+        table_header = self.result_table.horizontalHeader()
+        table_header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        table_header.setStretchLastSection(True)
         self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.result_table.setMinimumSize(360, 180)
         splitter.addWidget(self.result_table)
 
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumWidth(420)
-        self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; background: #1e1e1e; color: #ddd;")
+        self.log_text.setMinimumWidth(240)
+        self.log_text.setMaximumWidth(560)
+        self.log_text.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 11px; background: #1e1e1e; color: #ddd;")
         splitter.addWidget(self.log_text)
-        splitter.setSizes([580, 420])
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([620, 380])
+        splitter.setMinimumHeight(180)
 
-        speed_layout.addWidget(splitter)
-        layout.addWidget(speed_group)
+        speed_layout.addWidget(splitter, 1)
+        layout.addWidget(speed_group, 1)
 
-        # ── Section 3: Write + Export ─────────────────────────
+        # ── Section 4: Write + Export ─────────────────────────
         bottom_group = QGroupBox("💾 写入配置、热重载与多端导出")
         bottom_outer = QVBoxLayout(bottom_group)
-        bottom_layout = QHBoxLayout()
+        bottom_outer.setSpacing(6)
+
+        # Five long-labelled buttons in a 3-column grid: two rows of equal
+        # width instead of one row that clips at 125 % DPI.
+        bottom_layout = QGridLayout()
+        bottom_layout.setHorizontalSpacing(8)
+        bottom_layout.setVerticalSpacing(6)
 
         self.write_btn = QPushButton("✅ 将勾选的 IP 写入 FlClash 并热重载")
-        self.write_btn.setStyleSheet("padding: 7px; background: #2196F3; color: white; border-radius: 4px; font-weight: bold;")
+        self.write_btn.setStyleSheet(
+            "padding: 7px; background: #2196F3; color: white; border-radius: 4px; font-weight: bold;")
+        self.write_btn.setMinimumHeight(32)
         self.write_btn.clicked.connect(self._write_selected_ips)
-        bottom_layout.addWidget(self.write_btn)
+        bottom_layout.addWidget(self.write_btn, 0, 0)
 
         self.restart_flclash_btn = QPushButton("🔄 一键重启 FlClash (生效9090端口与新IP)")
-        self.restart_flclash_btn.setStyleSheet("padding: 7px; background: #607D8B; color: white; border-radius: 4px;")
+        self.restart_flclash_btn.setStyleSheet(
+            "padding: 7px; background: #607D8B; color: white; border-radius: 4px;")
+        self.restart_flclash_btn.setMinimumHeight(32)
         self.restart_flclash_btn.clicked.connect(self._restart_flclash)
-        bottom_layout.addWidget(self.restart_flclash_btn)
+        bottom_layout.addWidget(self.restart_flclash_btn, 0, 1)
 
         self.rollback_btn = QPushButton("⏪ 一键回滚上次备份")
-        self.rollback_btn.setStyleSheet("padding: 7px; background: #9E9E9E; color: white; border-radius: 4px;")
+        self.rollback_btn.setStyleSheet(
+            "padding: 7px; background: #9E9E9E; color: white; border-radius: 4px;")
+        self.rollback_btn.setMinimumHeight(32)
         self.rollback_btn.clicked.connect(self._rollback)
-        bottom_layout.addWidget(self.rollback_btn)
+        bottom_layout.addWidget(self.rollback_btn, 0, 2)
 
         self.export_btn = QPushButton("📲 一键导出手机与电视端配置")
-        self.export_btn.setStyleSheet("padding: 7px; background: #9C27B0; color: white; border-radius: 4px; font-weight: bold;")
+        self.export_btn.setStyleSheet(
+            "padding: 7px; background: #9C27B0; color: white; border-radius: 4px; font-weight: bold;")
+        self.export_btn.setMinimumHeight(32)
         self.export_btn.clicked.connect(self._export_configs)
-        bottom_layout.addWidget(self.export_btn)
+        bottom_layout.addWidget(self.export_btn, 1, 0)
 
         self.topology_btn = QPushButton("🧩 应用多端优化拓扑 (机场链式代理 + IPv6加固)")
-        self.topology_btn.setStyleSheet("padding: 7px; background: #00897B; color: white; border-radius: 4px;")
+        self.topology_btn.setStyleSheet(
+            "padding: 7px; background: #00897B; color: white; border-radius: 4px;")
+        self.topology_btn.setMinimumHeight(32)
         self.topology_btn.setToolTip("把机场链式落地、流媒体/AI 分流、IPv6/mux 加固写入当前 FlClash 配置（自动备份）")
         self.topology_btn.clicked.connect(self._apply_topology)
-        bottom_layout.addWidget(self.topology_btn)
+        bottom_layout.addWidget(self.topology_btn, 1, 1, 1, 2)
 
+        for col in range(3):
+            bottom_layout.setColumnStretch(col, 1)
         bottom_outer.addLayout(bottom_layout)
 
         lan_row = QHBoxLayout()
@@ -815,7 +873,119 @@ class MainWindow(QMainWindow):
         self.lan_info_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         bottom_outer.addWidget(self.lan_info_lbl)
 
-        layout.addWidget(bottom_group)
+        layout.addWidget(bottom_group, 0)
+
+        # ── Section 5: Client & profile (collapsible, closed) ──
+        client_section = CollapsibleSection(
+            "🔌 客户端与配置文件（FlClash / Clash Verge Rev / Mihomo Party / 本地 YAML）",
+            expanded=False)
+        self.client_section = client_section
+        client_layout = client_section.body_layout
+
+        client_grid = QGridLayout()
+        client_grid.setHorizontalSpacing(8)
+        client_grid.setVerticalSpacing(6)
+        client_grid.setColumnStretch(1, 1)
+
+        client_grid.addWidget(QLabel("客户端:"), 0, 0)
+        self.client_combo = QComboBox()
+        self.client_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.client_combo.addItem("自动检测（推荐）", "auto")
+        for key, label in CLIENT_LABELS.items():
+            if key == "manual":
+                continue
+            self.client_combo.addItem(label, key)
+        self.client_combo.addItem("手动选择 YAML…", "manual")
+        self.client_combo.currentIndexChanged.connect(self._on_client_changed)
+        client_grid.addWidget(self.client_combo, 0, 1)
+
+        self.client_rescan_btn = QPushButton("🔄 重新扫描")
+        self.client_rescan_btn.setStyleSheet("padding: 4px;")
+        self.client_rescan_btn.setToolTip("重新扫描本机 FlClash / Clash Verge Rev / Mihomo Party 的配置目录")
+        self.client_rescan_btn.clicked.connect(lambda: self._refresh_client_choices(refresh=True))
+        client_grid.addWidget(self.client_rescan_btn, 0, 2)
+
+        client_grid.addWidget(QLabel("配置:"), 1, 0)
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(280)
+        self.profile_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
+        client_grid.addWidget(self.profile_combo, 1, 1)
+
+        self.browse_btn = QPushButton("📂 浏览…")
+        self.browse_btn.setStyleSheet("padding: 4px;")
+        self.browse_btn.clicked.connect(self._browse_profile)
+        client_grid.addWidget(self.browse_btn, 1, 2)
+
+        client_grid.addWidget(QLabel("YAML 路径:"), 2, 0)
+        self.client_path_edit = QLineEdit(self.profile_path or "")
+        self.client_path_edit.setPlaceholderText("选择任意本地 Clash / Mihomo YAML 配置文件")
+        client_grid.addWidget(self.client_path_edit, 2, 1, 1, 2)
+
+        client_grid.addWidget(QLabel("外部控制 API:"), 3, 0)
+        self.api_url_edit = QLineEdit(self.cfg.get("external_controller", "127.0.0.1:9090"))
+        self.api_url_edit.setPlaceholderText("127.0.0.1:9090")
+        self.api_url_edit.setMinimumWidth(160)
+        client_grid.addWidget(self.api_url_edit, 3, 1)
+
+        self.api_test_btn = QPushButton("🔌 测试连接")
+        self.api_test_btn.setStyleSheet("padding: 4px;")
+        self.api_test_btn.clicked.connect(self._test_clash_api)
+        client_grid.addWidget(self.api_test_btn, 3, 2)
+
+        client_grid.addWidget(QLabel("Secret:"), 4, 0)
+        self.api_secret_edit = QLineEdit(self.cfg.get("secret", ""))
+        self.api_secret_edit.setPlaceholderText("留空表示无密钥")
+        self.api_secret_edit.setMinimumWidth(160)
+        client_grid.addWidget(self.api_secret_edit, 4, 1)
+
+        self.client_apply_btn = QPushButton("✅ 应用配置")
+        self.client_apply_btn.setStyleSheet(
+            "padding: 5px 12px; background: #1565C0; color: white; border-radius: 4px; font-weight: bold;")
+        self.client_apply_btn.clicked.connect(self._apply_client_settings)
+        client_grid.addWidget(self.client_apply_btn, 4, 2)
+
+        client_layout.addLayout(client_grid)
+
+        self.client_status_lbl = QLabel("")
+        self.client_status_lbl.setStyleSheet("font-size: 11px; color: #555;")
+        self.client_status_lbl.setWordWrap(True)
+        self.client_status_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        client_layout.addWidget(self.client_status_lbl)
+
+        layout.addWidget(client_section, 0)
+        self._refresh_client_choices()
+
+        # ── Section 6: Startup & close behaviour (collapsible) ─
+        startup_section = CollapsibleSection(
+            "🖥️ 启动与关闭行为（系统托盘 / 开机自启）", expanded=False)
+        self.startup_section = startup_section
+        startup_layout = startup_section.body_layout
+
+        self.close_to_tray_chk = QCheckBox("关闭窗口时最小化到系统托盘（保持后台巡检）")
+        self.close_to_tray_chk.setStyleSheet("font-weight: bold; color: #00695C;")
+        self.close_to_tray_chk.setToolTip(
+            "勾选后点击右上角 × 只会隐藏到右下角托盘，后台自动巡检与局域网订阅服务继续运行；\n"
+            "在托盘菜单选择「❌ 完全退出程序」才会真正停止全部后台服务。")
+        self.close_to_tray_chk.setChecked(bool(self.cfg.get("close_to_tray", True)))
+        self.close_to_tray_chk.toggled.connect(self._toggle_close_to_tray)
+        startup_layout.addWidget(self.close_to_tray_chk)
+
+        self.auto_start_chk = QCheckBox("开机自动启动（静默缩至右下角托盘）")
+        self.auto_start_chk.setStyleSheet("font-weight: bold; color: #1565C0;")
+        self.auto_start_chk.setToolTip(
+            "写入当前用户注册表 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run，\n"
+            "登录后以 --minimized 参数静默启动，无需管理员权限。")
+        self.auto_start_chk.toggled.connect(self._toggle_auto_start)
+        startup_layout.addWidget(self.auto_start_chk)
+
+        self.auto_start_lbl = QLabel("")
+        self.auto_start_lbl.setStyleSheet("font-size: 11px; color: #555;")
+        self.auto_start_lbl.setWordWrap(True)
+        self.auto_start_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        startup_layout.addWidget(self.auto_start_lbl)
+
+        layout.addWidget(startup_section, 0)
         return tab
 
     # ══════════════════════════════════════════════════════════════
@@ -853,6 +1023,16 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"已扫描 {len(self._client_rows)} 个客户端目录，发现 {total} 个 YAML 配置")
 
+    def _update_client_summary(self):
+        """Mirror the active profile into the collapsed client panel header."""
+        section = getattr(self, "client_section", None)
+        if section is None:
+            return
+        if self.profile_path and os.path.isfile(self.profile_path):
+            section.set_summary(f"当前配置：{os.path.basename(self.profile_path)}")
+        else:
+            section.set_summary("尚未选择配置")
+
     def _on_client_changed(self, index: int):
         key = self.client_combo.currentData() or "auto"
         rows = self._profile_rows()
@@ -883,6 +1063,7 @@ class MainWindow(QMainWindow):
         self.client_status_lbl.setText(
             f"已识别 {len(self._client_rows)} 个客户端目录 / {total} 个可用配置；"
             f"当前使用: {os.path.basename(self.profile_path) if self.profile_path else '未选择'}")
+        self._update_client_summary()
 
     def _on_profile_selected(self, index: int):
         row = self.profile_combo.itemData(index)
