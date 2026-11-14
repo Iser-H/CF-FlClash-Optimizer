@@ -392,6 +392,8 @@ class CollapsibleSection(QWidget):
     QGroupBox layout, therefore no widget or signal/slot wiring has to change.
     """
 
+    toggled = Signal(bool)
+
     def __init__(self, title: str, expanded: bool = True, parent=None):
         super().__init__(parent)
 
@@ -444,6 +446,7 @@ class CollapsibleSection(QWidget):
     def _on_toggled(self, expanded: bool):
         self.body.setVisible(expanded)
         self._toggle_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggled.emit(bool(expanded))
 
     def is_expanded(self) -> bool:
         return self._toggle_btn.isChecked()
@@ -476,11 +479,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CF-FlClash-Optimizer — Cloudflare 优选 IP 体检与多端配置导出")
-        # The tab scrolls when space runs out, so the hard minimum only has to
-        # fit a 1920x1080 panel at 150 % scaling; the default size is capped by
-        # the current screen's work area (DPI aware) instead of overflowing it.
-        self.setMinimumSize(980, 640)
-        self.resize(self._preferred_window_size())
+        # Both sizes are derived from the current screen work area, so a small
+        # desktop or 150 % scaling can never push the window off-screen. The
+        # tab content scrolls, so the minimum is allowed to shrink with it.
+        minimum_size, preferred_size = self._window_sizes()
+        self.setMinimumSize(minimum_size)
+        self.resize(preferred_size)
 
         # Tray / shutdown state — created before any UI so closeEvent is always safe.
         self._force_quit = False          # set by the tray "完全退出程序" action
@@ -595,15 +599,32 @@ class MainWindow(QMainWindow):
         return configured
 
     @staticmethod
-    def _preferred_window_size() -> QSize:
-        """Default size capped by the screen work area (DPI scaled)."""
-        width, height = 1180, 1000
+    def _screen_work_area() -> QSize:
+        """Logical size of the primary screen's work area (0x0 when unknown)."""
         screen = QApplication.primaryScreen()
-        if screen is not None:
-            avail = screen.availableGeometry()
-            width = max(980, min(width, avail.width() - 40))
-            height = max(640, min(height, avail.height() - 48))
-        return QSize(width, height)
+        if screen is None:
+            return QSize(0, 0)
+        return screen.availableGeometry().size()
+
+    @classmethod
+    def _window_sizes(cls) -> tuple:
+        """(minimum, preferred) sizes that always fit the screen work area.
+
+        The tab content scrolls, so on a small or heavily scaled desktop the
+        minimum may drop below the usual 980x640 instead of pushing the window
+        off-screen. The 40/48 px margins leave room for the frame and taskbar.
+        """
+        preferred_w, preferred_h = 1180, 1000
+        minimum_w, minimum_h = 980, 640
+        avail = cls._screen_work_area()
+        if avail.width() > 0 and avail.height() > 0:
+            usable_w = max(480, avail.width() - 40)
+            usable_h = max(360, avail.height() - 48)
+            preferred_w = min(preferred_w, usable_w)
+            preferred_h = min(preferred_h, usable_h)
+            minimum_w = min(minimum_w, preferred_w)
+            minimum_h = min(minimum_h, preferred_h)
+        return QSize(minimum_w, minimum_h), QSize(preferred_w, preferred_h)
 
     def _build_tab1(self) -> QWidget:
         """Single workflow tab: health check → speed test → write / export.
@@ -880,6 +901,7 @@ class MainWindow(QMainWindow):
             "🔌 客户端与配置文件（FlClash / Clash Verge Rev / Mihomo Party / 本地 YAML）",
             expanded=False)
         self.client_section = client_section
+        client_section.toggled.connect(self._on_section_toggled)
         client_layout = client_section.body_layout
 
         client_grid = QGridLayout()
@@ -920,6 +942,7 @@ class MainWindow(QMainWindow):
         client_grid.addWidget(QLabel("YAML 路径:"), 2, 0)
         self.client_path_edit = QLineEdit(self.profile_path or "")
         self.client_path_edit.setPlaceholderText("选择任意本地 Clash / Mihomo YAML 配置文件")
+        self.client_path_edit.textChanged.connect(self._update_client_summary)
         client_grid.addWidget(self.client_path_edit, 2, 1, 1, 2)
 
         client_grid.addWidget(QLabel("外部控制 API:"), 3, 0)
@@ -960,6 +983,7 @@ class MainWindow(QMainWindow):
         startup_section = CollapsibleSection(
             "🖥️ 启动与关闭行为（系统托盘 / 开机自启）", expanded=False)
         self.startup_section = startup_section
+        startup_section.toggled.connect(self._on_section_toggled)
         startup_layout = startup_section.body_layout
 
         self.close_to_tray_chk = QCheckBox("关闭窗口时最小化到系统托盘（保持后台巡检）")
@@ -1023,15 +1047,53 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"已扫描 {len(self._client_rows)} 个客户端目录，发现 {total} 个 YAML 配置")
 
-    def _update_client_summary(self):
-        """Mirror the active profile into the collapsed client panel header."""
+    def _update_client_summary(self, *_text):
+        """Keep the collapsed panel header in sync with the selected YAML.
+
+        The path box is the source of truth for the pending selection; when it
+        differs from the applied profile the header says 待应用, so switching
+        client / browsing / applying stays accurate while the body is hidden.
+        """
         section = getattr(self, "client_section", None)
         if section is None:
             return
-        if self.profile_path and os.path.isfile(self.profile_path):
-            section.set_summary(f"当前配置：{os.path.basename(self.profile_path)}")
+        edit = getattr(self, "client_path_edit", None)
+        selected = (edit.text() or "").strip() if edit is not None else ""
+        applied = (self.profile_path or "").strip()
+        if selected:
+            same = False
+            if applied:
+                try:
+                    same = (os.path.normcase(os.path.abspath(selected))
+                            == os.path.normcase(os.path.abspath(applied)))
+                except (OSError, ValueError):
+                    same = False
+            prefix = "当前配置" if same else "待应用"
+            section.set_summary(f"{prefix}：{os.path.basename(selected)}")
+        elif applied:
+            section.set_summary(f"当前配置：{os.path.basename(applied)}")
         else:
             section.set_summary("尚未选择配置")
+
+    def _on_section_toggled(self, _expanded: bool):
+        """Relayout the scroll content after a panel is shown or hidden."""
+        scroll = getattr(self, "main_scroll", None)
+        if scroll is None:
+            return
+        content = scroll.widget()
+        if content is not None and content.layout() is not None:
+            content.layout().activate()
+        # Hiding the body shrinks the content in this event-loop turn; clamp on
+        # the next turn so the bar cannot keep a value past its new maximum
+        # (which would leave the viewport showing a blank strip).
+        QTimer.singleShot(0, self._clamp_main_scroll)
+
+    def _clamp_main_scroll(self):
+        scroll = getattr(self, "main_scroll", None)
+        if scroll is None:
+            return
+        bar = scroll.verticalScrollBar()
+        bar.setValue(min(bar.value(), bar.maximum()))
 
     def _on_client_changed(self, index: int):
         key = self.client_combo.currentData() or "auto"
@@ -1159,6 +1221,7 @@ class MainWindow(QMainWindow):
             self._start_guard()
         self._refresh_node_cards()
         self._refresh_client_choices()
+        self._update_client_summary()
         self.client_status_lbl.setText(
             f"✅ 已应用: {os.path.basename(path)}  ·  API http://{api}")
         self.statusBar().showMessage(f"客户端配置已更新: {path}")
