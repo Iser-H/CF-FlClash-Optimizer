@@ -1,0 +1,35 @@
+CF-FlClash-Optimizer v1.3.1 — 第三方组件声明
+==========================================================
+
+1) CloudflareSpeedTest (cfst.exe)
+   项目主页 : https://github.com/XIU2/CloudflareSpeedTest
+   许可证   : GNU General Public License v3.0（全文见 licenses/CloudflareSpeedTest-LICENSE.txt）
+   二进制来源: https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_windows_amd64.zip（官方 GitHub Releases，
+               cfst_windows_amd64.zip 内的 cfst.exe，架构 0x8664）
+   自报版本 : v2.3.5
+   ZIP SHA256: 67d06a0c68b7fd6998d5e6abea1dbf850cac2c19c5d8c5980aa32fc7aba1ff5f
+   EXE SHA256: f8b38bbc265e8906d0f8549c84cc70653d8d798319db63790fc57d018216702a
+   字节数    : 8430592
+   说明      : 官方 release 未提供独立校验值文件，本清单中的 SHA256 由打包流程在本机
+               计算并记录，不代表已获得官方校验值。
+
+2) PySide6 / Qt
+   许可证: LGPLv3 / GPLv3（以 PySide6 官方发布说明为准），随 PyInstaller 打包
+   说明  : 本程序以未修改的动态库形式分发 Qt 运行库。
+
+3) ruamel.yaml
+   许可证: MIT
+
+4) requests / urllib3 / certifi / idna / charset-normalizer
+   许可证: Apache-2.0（urllib3 为 MIT）
+
+5) Pillow (PIL)
+   许可证: HPND / PIL Software License
+
+6) qrcode
+   许可证: BSD-3-Clause
+
+7) Python
+   许可证: PSF License
+
+本程序自身代码不包含任何第三方订阅内容、UUID、密钥或用户配置。

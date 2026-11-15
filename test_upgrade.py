@@ -55,6 +55,14 @@ FAIL = 0
 FAILURES = []
 
 
+def conn_params(node):
+    """Connection parameters only: ``name`` / ``dialer-proxy`` excluded."""
+    data = json.loads(json.dumps(ct.to_builtin(dict(node)), default=str))
+    for key in ("name", "dialer-proxy"):
+        data.pop(key, None)
+    return data
+
+
 def check(name, condition, detail=""):
     global PASS, FAIL
     if condition:
@@ -333,6 +341,7 @@ def test_configs(tmp: str, profile_path: str, options: dict):
     print("\n📋 2. 多端配置模板 / 链式代理 / IPv6 加固")
     pm = ProfileManager(profile_path, os.path.join(tmp, "backups"), CF_NAMES, options=options)
     data = pm.load()
+    snapshot = dump_yaml_text(data)
 
     optimized, summary = build_optimized_profile(data, options)
     check("机场节点合并（排除广告节点）", summary["airport_nodes"] == 4,
@@ -346,6 +355,19 @@ def test_configs(tmp: str, profile_path: str, options: dict):
     check("链式节点 dialer-proxy 指向机场前置组",
           chain is not None and chain.get("dialer-proxy") == ct.DEFAULT_OPTIONS["front_group_name"],
           str(chain.get("dialer-proxy") if chain else None))
+    direct = proxies.get(ct.DEFAULT_OPTIONS["direct_landing_node_name"])
+    check("直连节点已生成且无 dialer-proxy",
+          direct is not None and "dialer-proxy" not in direct,
+          str(direct.get("name") if direct else None))
+    check("链式/直连均为 VLESS",
+          str((chain or {}).get("type")) == "vless" and str((direct or {}).get("type")) == "vless")
+    check("直连与链式仅差 name / dialer-proxy",
+          direct is not None and chain is not None and conn_params(chain) == conn_params(direct))
+    original_landing = next((p for p in data["proxies"]
+                             if str(p.get("name")) == options.get("chain_landing_node_name")), None)
+    check("原始 profile 未被 build_optimized_profile 修改",
+          (original_landing is None or "dialer-proxy" not in original_landing)
+          and dump_yaml_text(data) == snapshot)
     front = groups.get(ct.DEFAULT_OPTIONS["front_group_name"], {})
     check("机场前置优选为 url-test 且含美西节点",
           front.get("type") == "url-test"
@@ -375,17 +397,32 @@ def test_configs(tmp: str, profile_path: str, options: dict):
           str({k: auto.get(k) for k in ("type", "hidden", "interval", "tolerance")}))
     check("机场前置优选隐藏",
           groups.get(ct.DEFAULT_OPTIONS["front_group_name"], {}).get("hidden") is True)
-    check("AI 链式组仅保留唯一链式节点",
-          groups.get(ct.DEFAULT_OPTIONS["ai_chain_group_name"], {}).get("proxies")
-          == [ct.DEFAULT_OPTIONS["ai_chain_node_name"]])
-    check("PROXY 仅 4 个顶层项",
+    check("AI 链式组为 select，成员顺序为链式 → 直连",
+          groups.get(ct.DEFAULT_OPTIONS["ai_chain_group_name"], {}).get("type") == "select"
+          and groups.get(ct.DEFAULT_OPTIONS["ai_chain_group_name"], {}).get("proxies") == [
+              ct.DEFAULT_OPTIONS["ai_chain_node_name"],
+              ct.DEFAULT_OPTIONS["direct_landing_node_name"]],
+          str(groups.get(ct.DEFAULT_OPTIONS["ai_chain_group_name"], {}).get("proxies")))
+    check("PROXY 顺序为 日常 → 流媒体 → AI链式 → VPS直连 → DIRECT",
           groups.get("PROXY", {}).get("proxies") == [
               ct.DEFAULT_OPTIONS["daily_group_name"],
               ct.DEFAULT_OPTIONS["stream_group_name"],
               ct.DEFAULT_OPTIONS["ai_chain_group_name"],
+              ct.DEFAULT_OPTIONS["direct_landing_node_name"],
               "DIRECT",
           ],
           str(groups.get("PROXY", {}).get("proxies")))
+    twice, _twice_summary = build_optimized_profile(optimized, options)
+    twice_names = [str(p.get("name")) for p in twice["proxies"]]
+    twice_groups = {str(g.get("name")): g for g in twice["proxy-groups"]}
+    check("重复构建不重复生成节点",
+          twice_names.count(ct.DEFAULT_OPTIONS["ai_chain_node_name"]) == 1
+          and twice_names.count(ct.DEFAULT_OPTIONS["direct_landing_node_name"]) == 1,
+          f"{twice_names.count(ct.DEFAULT_OPTIONS['direct_landing_node_name'])} direct copies")
+    check("重复构建策略组成员不变",
+          twice_groups["PROXY"].get("proxies") == groups["PROXY"].get("proxies")
+          and twice_groups[ct.DEFAULT_OPTIONS["ai_chain_group_name"]].get("proxies")
+          == groups[ct.DEFAULT_OPTIONS["ai_chain_group_name"]].get("proxies"))
     check("废节点 CF-保底 已彻底删除",
           "CF-保底" not in {str(p.get("name")) for p in optimized["proxies"]}
           and all("CF-保底" not in [str(m) for m in (g.get("proxies") or [])]
@@ -418,6 +455,16 @@ def test_configs(tmp: str, profile_path: str, options: dict):
                     if p.get("name") == ct.DEFAULT_OPTIONS["ai_chain_node_name"]]
     check("iOS YAML 含 dialer-proxy", chain_parsed and chain_parsed[0].get("dialer-proxy")
           == ct.DEFAULT_OPTIONS["front_group_name"])
+    direct_parsed = [p for p in parsed["proxies"]
+                     if p.get("name") == ct.DEFAULT_OPTIONS["direct_landing_node_name"]]
+    check("iOS YAML 含 VPS 直连节点且无 dialer-proxy",
+          len(direct_parsed) == 1 and "dialer-proxy" not in direct_parsed[0],
+          str(len(direct_parsed)))
+    ios_groups = {str(g.get("name")): g for g in parsed.get("proxy-groups") or []}
+    check("iOS YAML 策略组顺序正确",
+          ios_groups.get("PROXY", {}).get("proxies") == groups["PROXY"].get("proxies")
+          and ios_groups.get(ct.DEFAULT_OPTIONS["ai_chain_group_name"], {}).get("proxies")
+          == groups[ct.DEFAULT_OPTIONS["ai_chain_group_name"]].get("proxies"))
     cf_parsed = [p for p in parsed["proxies"] if p.get("name") in CF_NAMES]
     check("全部 CF 节点 mux 关闭",
           len(cf_parsed) == 3 and all((p.get("mux") or {}).get("enabled") is False for p in cf_parsed))
@@ -519,6 +566,12 @@ rules:
     check("拓扑写入链式节点",
           tproxies.get(ct.DEFAULT_OPTIONS["ai_chain_node_name"], {}).get("dialer-proxy")
           == ct.DEFAULT_OPTIONS["front_group_name"])
+    check("拓扑写入 VPS 直连节点（无 dialer-proxy）",
+          ct.DEFAULT_OPTIONS["direct_landing_node_name"] in tproxies
+          and "dialer-proxy" not in tproxies[ct.DEFAULT_OPTIONS["direct_landing_node_name"]])
+    check("Auto-Guard 节点范围仍只含 3 个 CF 优选",
+          [n["name"] for n in topo_pm.get_node_full_info()] == CF_NAMES,
+          str(len(topo_pm.get_node_full_info())))
     check("拓扑加固 DNS/IPv6/mux",
           tdata.get("ipv6") is False and tdata["dns"].get("ipv6") is False
           and tdata["dns"].get("enhanced-mode") == "fake-ip"
@@ -548,6 +601,8 @@ rules:
           "rules: -\n" not in open(tpaths["flclash"], encoding="utf-8").read()
           and "rules: -\n" not in open(tpaths["ios"], encoding="utf-8").read())
 
+    direct_server_before = str(tproxies.get(
+        ct.DEFAULT_OPTIONS["direct_landing_node_name"], {}).get("server"))
     topo_pm.update_node_ips_by_index(["104.20.1.1", "104.21.2.2", "104.22.3.3"])
     tdata3 = topo_pm.load()
     tproxies3 = {str(p.get("name")): p for p in tdata3["proxies"]}
@@ -555,6 +610,12 @@ rules:
           str(tproxies3[CF_NAMES[0]].get("server")) == "104.20.1.1"
           and ct.DEFAULT_OPTIONS["ai_chain_node_name"] in tproxies3
           and all((tproxies3[n].get("mux") or {}).get("enabled") is False for n in CF_NAMES))
+    check("换 IP 不修改 VPS 直连/链式节点",
+          str(tproxies3.get(ct.DEFAULT_OPTIONS["direct_landing_node_name"], {})
+              .get("server")) == direct_server_before
+          and str(tproxies3.get(ct.DEFAULT_OPTIONS["ai_chain_node_name"], {})
+                  .get("server")) == direct_server_before,
+          f"{direct_server_before} vs 104.20.1.1")
     return pm
 
 
@@ -578,6 +639,9 @@ def test_exports(tmp: str, pm: ProfileManager, options: dict):
     check("FlClash 桌面端导出含链式代理与最新 IP",
           "dialer-proxy" in flclash_text and "ipv6: false" in flclash_text
           and all(ip in flclash_text for ip in new_ips))
+    check("FlClash/iOS 导出均含 VPS 直连节点",
+          ct.DEFAULT_OPTIONS["direct_landing_node_name"] in flclash_text
+          and ct.DEFAULT_OPTIONS["direct_landing_node_name"] in ios_text)
     check("iOS 导出含最新替换 IP", all(ip in ios_text for ip in new_ips))
     check("Happ 订阅含最新替换 IP", all(ip in happ_text for ip in new_ips))
     check("Happ 自动更新/自动连接指令",
@@ -684,6 +748,11 @@ def test_lan_server(tmp: str, profile_path: str, options: dict):
         check("/flclash.yaml 含链式代理与 url-test",
               "dialer-proxy" in resp_flclash.text
               and ct.DEFAULT_OPTIONS["stream_group_name"] in resp_flclash.text)
+        check("/flclash.yaml 含 VPS 直连节点与更新后的策略组",
+              resp_flclash.text.count(ct.DEFAULT_OPTIONS["direct_landing_node_name"]) >= 2
+              and ct.DEFAULT_OPTIONS["ai_chain_group_name"] in resp_flclash.text)
+        check("/ios.yaml 含 VPS 直连节点",
+              ct.DEFAULT_OPTIONS["direct_landing_node_name"] in resp.text)
 
         resp_happ = requests.get(f"{base}/tv_happ.txt", timeout=10)
         check("GET /s/<token>/tv_happ.txt 返回 200", resp_happ.status_code == 200)

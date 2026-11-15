@@ -170,6 +170,67 @@ class ProfileManager:
         return str(self._ensure_loaded().get("external-controller", "127.0.0.1:9090"))
 
     # ── topology ─────────────────────────────────────────────────
+    def topology_preflight(self) -> Dict[str, Any]:
+        """Dry-run the topology build and evaluate the write-safety gates.
+
+        Nothing is written here: the caller must show the result (target path,
+        node counts, blocking problems) before calling
+        :meth:`apply_optimized_topology`.  This is what stops the program from
+        writing a topology into an airport subscription file.
+        """
+        data = self.load()
+        profile, summary = build_optimized_profile(data, self.options)
+        target = os.path.abspath(self.profile_path)
+        airport = str(self.options.get("airport_profile_path") or "").strip()
+        problems: List[str] = []
+
+        if not os.path.isfile(target):
+            problems.append(f"目标配置文件不存在: {target}")
+        if airport:
+            if os.path.normcase(os.path.abspath(airport)) == os.path.normcase(target):
+                problems.append(
+                    "工作配置与机场订阅指向同一个文件：机场订阅只能作为节点来源，"
+                    "工作配置必须是 FlClash 实际在用的 profile（禁止写入）")
+        cf_nodes = list(summary.get("cf_nodes") or [])
+        if not cf_nodes:
+            problems.append(
+                "未识别到任何 CF 优选节点（0/3）：目标文件可能选错了"
+                "（例如选中了机场订阅），已禁止写入")
+        if not summary.get("landing_node"):
+            problems.append(
+                "未找到原始 VPS 落地节点（chain_landing_node_name 或名称兜底均未命中）："
+                "链式/直连节点无法生成，已禁止写入不完整拓扑")
+        if not summary.get("chain_node"):
+            problems.append(
+                "链式落地节点未生成（机场节点或机场前置组为空）："
+                "已禁止写入不完整拓扑")
+        if not summary.get("direct_node"):
+            problems.append(
+                "VPS 直连节点未生成（落地节点不是有效 VLESS 或名称冲突）："
+                "已禁止写入不完整拓扑")
+        if summary.get("chain_entry_problem"):
+            problems.append(
+                f"AI 链路入口设置无效：{summary['chain_entry_problem']}")
+
+        return {
+            "ok": not problems,
+            "problems": problems,
+            "warnings": list(summary.get("warnings") or []),
+            "target": target,
+            "airport": airport,
+            "cf_nodes": cf_nodes,
+            "airport_nodes": int(summary.get("airport_nodes") or 0),
+            "landing_node": str(summary.get("landing_node") or ""),
+            "chain_node": str(summary.get("chain_node") or ""),
+            "chain_entry": str(summary.get("chain_entry") or ""),
+            "chain_entry_requested": str(summary.get("chain_entry_requested") or ""),
+            "direct_node": str(summary.get("direct_node") or ""),
+            "ai_members": list(summary.get("ai_group_members") or []),
+            "proxy_members": list(summary.get("proxy_members") or []),
+            "summary": summary,
+            "_profile": profile,
+        }
+
     def apply_optimized_topology(self) -> Dict[str, Any]:
         """Install the multi-client topology into the live FlClash profile.
 

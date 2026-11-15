@@ -26,13 +26,33 @@
   "airport_profile_path": "",
   "airport_exclude_paths": [],
   "airport_managed_nodes": [],
-  "airport_exclude_keywords": ["流量", "到期", "重置", "官网", "剩余", "套餐"],
-  "airport_us_keywords": ["united states", "美国", "美西", "los angeles", "洛杉矶"],
+  "airport_exclude_keywords": [
+    "流量",
+    "到期",
+    "重置",
+    "官网",
+    "剩余",
+    "套餐"
+  ],
+  "airport_us_keywords": [
+    "united states",
+    "美国",
+    "美西",
+    "los angeles",
+    "洛杉矶"
+  ],
   "airport_max_nodes": 80,
   "chain_landing_node_name": "",
+  "direct_landing_node_name": "🇺🇸 洛杉矶-VPS-直连(AI)",
+  "chain_entry_node": "",
   "auto_airport_group_name": "⚡ 机场自动优选",
-  "excluded_node_names": ["CF-保底"],
-  "obsolete_group_names": ["自动（直连优先）", "🇺🇸 洛杉矶-CF优选"],
+  "excluded_node_names": [
+    "CF-保底"
+  ],
+  "obsolete_group_names": [
+    "自动（直连优先）",
+    "🇺🇸 洛杉矶-CF优选"
+  ],
   "auto_guard_enabled": false,
   "auto_guard_interval_min": 30,
   "auto_guard_max_loss": 5.0,

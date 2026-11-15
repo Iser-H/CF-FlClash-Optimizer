@@ -343,42 +343,80 @@ def test_firewall_helpers():
         calls.append([str(a) for a in args])
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    # Existing rule: only `set`, never a second `add`.
+    # Existing rule: only `set`, never a second `add`. The rule is repaired to
+    # cover Private+Public (a private-only rule is ignored on "Public" Wi-Fi,
+    # which is what made phones fail) while the scope stays LocalSubnet.
     with mock.patch.object(lan_server, "_run_netsh", side_effect=fake_cmd), \
             mock.patch.object(lan_server, "firewall_rule_exists", return_value=True), \
-            mock.patch.object(lan_server, "firewall_rule_is_hardened", return_value=False):
+            mock.patch.object(lan_server, "firewall_rule_is_hardened",
+                              side_effect=[False, True]), \
+            mock.patch.object(lan_server, "firewall_rule_applies",
+                              side_effect=[{"applies": False}, {"applies": True}]):
         info = ensure_firewall_rule_detailed(8686, allow_uac=False)
     check("已有规则复用而不新增",
           info.get("status") == "exists"
           and not any("add" in c for c in calls), str(calls))
-    check("已有规则被收紧为 private/LocalSubnet",
-          any("set" in c and "profile=private" in c and "remoteip=LocalSubnet" in c
-              for c in calls), str(calls))
+    check("已有规则被收紧为 专用+公用 / LocalSubnet",
+          any("set" in c and "profile=private,public" in c
+              and "remoteip=LocalSubnet" in c for c in calls), str(calls))
 
     # Already hardened rule: no set/add at all (no repeated UAC prompt).
     calls.clear()
     with mock.patch.object(lan_server, "_run_netsh", side_effect=fake_cmd), \
             mock.patch.object(lan_server, "firewall_rule_exists", return_value=True), \
-            mock.patch.object(lan_server, "firewall_rule_is_hardened", return_value=True):
+            mock.patch.object(lan_server, "firewall_rule_is_hardened", return_value=True), \
+            mock.patch.object(lan_server, "firewall_rule_applies",
+                              return_value={"applies": True}):
         info = ensure_firewall_rule_detailed(8686, allow_uac=True)
     check("已收紧的规则不再重复修改",
           info.get("status") == "exists" and calls == [], str(calls))
 
-    # Missing rule: add with private + LocalSubnet.
+    # Missing rule: add with Private+Public and LAN-only scope.
     calls.clear()
 
     with mock.patch.object(lan_server, "_run_netsh", side_effect=fake_cmd), \
             mock.patch.object(lan_server, "firewall_rule_exists",
-                              side_effect=[False, True]):
+                              side_effect=[False, True]), \
+            mock.patch.object(lan_server, "firewall_rule_applies",
+                              return_value={"applies": True}):
         info = ensure_firewall_rule_detailed(8686, allow_uac=False)
     add_call = next((c for c in calls if "add" in c), [])
     flat = " ".join(add_call).lower()
     check("缺失规则按实际端口新增",
           info.get("status") == "added" and "localport=8686" in flat)
-    check("新增规则绝不包含 public",
-          "profile=private" in flat and "public" not in flat)
+    check("新增规则覆盖专用+公用网络（公用 Wi-Fi 下手机可连）",
+          "profile=private,public" in flat)
+    check("新增规则绝不放开任意远程地址",
+          "remoteip=localsubnet" in flat and "remoteip=any" not in flat
+          and "profile=any" not in flat and "public" in flat)
     check("新增规则远程范围限制为本地子网",
           "remoteip=localsubnet" in flat)
+
+    # Applicability: a private-only rule must be reported as not covering a
+    # Public network, and the LAN-only scope must be the thing that protects.
+    with mock.patch.object(lan_server, "_rule_scope",
+                           return_value=("private", "localsubnet")), \
+            mock.patch.object(lan_server, "active_network_profiles",
+                              return_value=["public"]):
+        private_only = lan_server.firewall_rule_applies(8686)
+        check("private-only 规则在公用网络被判为不生效",
+              private_only.get("applies") is False,
+              str(private_only))
+        check("private-only 规则给出可执行的修复说明",
+              "公用" in str(private_only.get("detail", ""))
+              or "public" in str(private_only.get("detail", "")).lower())
+    with mock.patch.object(lan_server, "_rule_scope",
+                           return_value=("private,public", "localsubnet")), \
+            mock.patch.object(lan_server, "active_network_profiles",
+                              return_value=["public"]):
+        check("专用+公用规则在公用网络被判定生效",
+              lan_server.firewall_rule_applies(8686).get("applies") is True)
+    with mock.patch.object(lan_server, "_rule_scope",
+                           return_value=("private,public", "any")), \
+            mock.patch.object(lan_server, "active_network_profiles",
+                              return_value=["public"]):
+        check("远程地址 Any 的规则不算局域网加固",
+              lan_server.firewall_rule_is_hardened(8686) is False)
 
     # Rule enumeration only accepts this program's prefix.
     with mock.patch.object(lan_server, "_run_netsh", return_value=mock.Mock(
@@ -397,6 +435,7 @@ def test_firewall_helpers():
 
     with mock.patch.object(lan_server, "list_own_firewall_ports",
                            return_value=[8686, 8687, 9999]), \
+            mock.patch.object(lan_server, "_port_in_use", return_value=False), \
             mock.patch.object(lan_server, "remove_firewall_rule", side_effect=fake_remove):
         removed = remove_stale_firewall_rules(keep_port=8687)
     check("端口回退时清理旧端口规则",
@@ -463,7 +502,14 @@ def test_gui_defaults(tmp: str):
         window = main_gui.MainWindow()
         check("缺省配置下 LAN 服务未启动", "lan" not in calls, str(calls))
         check("缺省配置下复选框未勾选", not window.lan_chk.isChecked())
-        check("缺省配置下复制按钮不可用", not window.copy_lan_btn.isEnabled())
+        check("缺省配置下 4 条订阅复制按钮均不可用",
+              len(window.lan_copy_btns) == 4
+              and all(not btn.isEnabled() for btn in window.lan_copy_btns)
+              and all(not btn.isEnabled() for btn in window.lan_qr_btns))
+        check("缺省配置下订阅链接框为空",
+              all(not edit.text() for edit in window.lan_link_edits))
+        check("订阅链接框为可选中复制（只读但不禁用文本）",
+              all(edit.isReadOnly() for edit in window.lan_link_edits))
     finally:
         if window is not None:
             window._force_quit = True

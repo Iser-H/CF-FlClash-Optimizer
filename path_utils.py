@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """Path utilities - works both in dev and PyInstaller frozen mode."""
 
-import os
-import sys
+import hashlib
 import json
+import os
+import shutil
 import sqlite3
+import sys
+import time
+from typing import Optional
 
 
 def get_app_root() -> str:
@@ -57,12 +61,224 @@ def get_desktop_dir() -> str:
 
 
 APP_ROOT = get_app_root()
-BIN_DIR = os.path.join(APP_ROOT, "bin")
-BACKUPS_DIR = os.path.join(APP_ROOT, "backups")
-EXPORTS_DIR = os.path.join(APP_ROOT, "exports")
-CONFIG_FILE = os.path.join(APP_ROOT, "config.json")
-CFST_EXE = os.path.join(BIN_DIR, "cfst.exe")
+APP_NAME = "CF-FlClash-Optimizer"
+DATA_DIR_ENV = "CFFO_DATA_DIR"           # test/portable override (absolute path)
+MIGRATION_MARKER = ".data-migration-v13.json"
+
+# Folders that may hold a previous portable install next to the program folder.
+# `release_v1.2` is listed before `dist` on purpose: it holds the newest known
+# good user config, the older dist folder is only a fallback.
+LEGACY_DIR_NAMES = ("release_v1.2", "dist", "release_v1.1",
+                    "CF-FlClash-Optimizer-v1.2", "CF-FlClash-Optimizer")
+
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _is_writable_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f".cffo-write-test-{os.getpid()}")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
+def get_data_root() -> str:
+    """Fixed per-user data directory.
+
+    The shipped EXE always keeps user data in ``%APPDATA%\\CF-FlClash-Optimizer``
+    so moving / replacing the EXE never loses the configuration again.  Running
+    from sources with a local ``config.json`` keeps the portable layout (that is
+    what the test-suite expects), and ``CFFO_DATA_DIR`` overrides both.
+    """
+    override = str(os.environ.get(DATA_DIR_ENV) or "").strip()
+    if override:
+        return os.path.abspath(override)
+    appdata = str(os.environ.get("APPDATA") or "").strip() or os.path.expanduser("~")
+    fixed = os.path.join(appdata, APP_NAME)
+    if not _is_frozen() and os.path.isfile(os.path.join(APP_ROOT, "config.json")):
+        return APP_ROOT
+    if _is_writable_dir(fixed):
+        return fixed
+    return APP_ROOT
+
+
+DATA_ROOT = get_data_root()
+BIN_DIR = os.path.join(DATA_ROOT, "bin")
+BACKUPS_DIR = os.path.join(DATA_ROOT, "backups")
+EXPORTS_DIR = os.path.join(DATA_ROOT, "exports")
+CONFIG_FILE = os.path.join(DATA_ROOT, "config.json")
 IP_TXT = os.path.join(BIN_DIR, "ip.txt")
+
+
+def _frozen_exe_dir() -> str:
+    """Directory of the running EXE (PyInstaller onefile: not ``_MEIPASS``)."""
+    exe = str(getattr(sys, "executable", "") or "")
+    if not exe:
+        return APP_ROOT
+    try:
+        return os.path.dirname(os.path.abspath(exe))
+    except OSError:
+        return APP_ROOT
+
+
+def cfst_lookup_paths(frozen: Optional[bool] = None, exe_dir: Optional[str] = None,
+                      data_bin: Optional[str] = None) -> list:
+    """Ordered ``cfst.exe`` candidates.
+
+    In a frozen onefile build the binary shipped next to the EXE
+    (``<exe dir>\\bin\\cfst.exe``) wins: the unpacked ``sys._MEIPASS`` folder is a
+    throw-away temp directory and must never be the primary source for an
+    external helper.  The writable data folder is the fallback (and the first
+    choice when running from sources).
+    """
+    is_frozen = _is_frozen() if frozen is None else bool(frozen)
+    base = os.path.abspath(exe_dir or (_frozen_exe_dir() if is_frozen else APP_ROOT))
+    user_bin = os.path.abspath(data_bin or BIN_DIR)
+    ordered = (
+        [os.path.join(base, "bin", "cfst.exe"), os.path.join(user_bin, "cfst.exe")]
+        if is_frozen else
+        [os.path.join(user_bin, "cfst.exe"), os.path.join(base, "bin", "cfst.exe")]
+    )
+    paths, seen = [], set()
+    for path in ordered:
+        key = os.path.normcase(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(path)
+    return paths
+
+
+def cfst_candidates() -> list:
+    """Backwards-compatible alias of :func:`cfst_lookup_paths`."""
+    return cfst_lookup_paths()
+
+
+def resolve_cfst_exe(frozen: Optional[bool] = None, exe_dir: Optional[str] = None,
+                     data_bin: Optional[str] = None) -> str:
+    """Absolute path of the speed-test core (first existing candidate)."""
+    paths = cfst_lookup_paths(frozen=frozen, exe_dir=exe_dir, data_bin=data_bin)
+    for path in paths:
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+        except OSError:
+            continue
+    return paths[0]
+
+
+def cfst_diagnostics(frozen: Optional[bool] = None, exe_dir: Optional[str] = None,
+                     data_bin: Optional[str] = None) -> dict:
+    """What the program will use, where it looked, and whether it is there."""
+    paths = cfst_lookup_paths(frozen=frozen, exe_dir=exe_dir, data_bin=data_bin)
+    chosen = resolve_cfst_exe(frozen=frozen, exe_dir=exe_dir, data_bin=data_bin)
+    candidates = []
+    for path in paths:
+        exists = os.path.isfile(path)
+        try:
+            size = os.path.getsize(path) if exists else 0
+        except OSError:
+            size = 0
+        candidates.append({"path": path, "exists": exists, "size": size})
+    exists = os.path.isfile(chosen)
+    try:
+        size = os.path.getsize(chosen) if exists else 0
+    except OSError:
+        size = 0
+    return {"frozen": _is_frozen() if frozen is None else bool(frozen),
+            "chosen": chosen, "exists": exists, "size": size,
+            "candidates": candidates}
+
+
+CFST_EXE = resolve_cfst_exe()
+
+
+def ip_list_lookup(frozen: Optional[bool] = None, exe_dir: Optional[str] = None,
+                   data_bin: Optional[str] = None) -> list:
+    """Ordered ``ip.txt`` candidates (shipped package first when frozen)."""
+    is_frozen = _is_frozen() if frozen is None else bool(frozen)
+    base = os.path.abspath(exe_dir or (_frozen_exe_dir() if is_frozen else APP_ROOT))
+    user_bin = os.path.abspath(data_bin or BIN_DIR)
+    ordered = (
+        [os.path.join(base, "bin", "ip.txt"), os.path.join(user_bin, "ip.txt")]
+        if is_frozen else
+        [os.path.join(user_bin, "ip.txt"), os.path.join(base, "bin", "ip.txt")]
+    )
+    result, seen = [], set()
+    for path in ordered:
+        key = os.path.normcase(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+_BUILTIN_CF_IPV4_CIDRS = (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+)
+
+
+def write_builtin_ip_list(path: str) -> bool:
+    """Write the built-in official Cloudflare IPv4 CIDR list (fallback)."""
+    lines: list = []
+    try:
+        import cidr_pool
+        lines = [str(item) for item in
+                 (getattr(cidr_pool, "OFFICIAL_CF_IPV4_CIDRS", []) or [])]
+    except Exception:
+        lines = []
+    if not lines:
+        lines = list(_BUILTIN_CF_IPV4_CIDRS)
+    text = "# Cloudflare IPv4 CIDR list (built-in fallback)\n" + "\n".join(lines) + "\n"
+    try:
+        from storage_utils import atomic_write_text
+        atomic_write_text(path, text)
+        return True
+    except Exception:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+            return True
+        except OSError:
+            return False
+
+
+def resolve_ip_list_file(create: bool = True, frozen: Optional[bool] = None,
+                         exe_dir: Optional[str] = None,
+                         data_bin: Optional[str] = None) -> dict:
+    """Locate ``ip.txt`` for cfst, generating a built-in fallback when missing.
+
+    Returns ``{"path", "source", "exists", "generated"}`` where source is one of
+    ``package`` / ``data`` / ``generated`` / ``missing``.
+    """
+    paths = ip_list_lookup(frozen=frozen, exe_dir=exe_dir, data_bin=data_bin)
+    is_frozen = _is_frozen() if frozen is None else bool(frozen)
+    base = os.path.abspath(exe_dir or (_frozen_exe_dir() if is_frozen else APP_ROOT))
+    package_path = os.path.join(base, "bin", "ip.txt")
+    for path in paths:
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                source = "package" if os.path.normcase(path) == os.path.normcase(package_path) else "data"
+                return {"path": path, "source": source, "exists": True, "generated": False}
+        except OSError:
+            continue
+    target = paths[0] if is_frozen else paths[0]
+    # Fallback is always written to the writable data bin, never into the package.
+    target = os.path.join(os.path.abspath(data_bin or BIN_DIR), "ip.txt")
+    made = write_builtin_ip_list(target) if create else False
+    return {"path": target, "source": "generated" if made else "missing",
+            "exists": os.path.isfile(target), "generated": made}
 
 # Desktop export directory
 DESKTOP_DIR = get_desktop_dir()
@@ -70,7 +286,212 @@ DESKTOP_EXPORT_DIR = os.path.join(DESKTOP_DIR, "CF导出配置")
 
 # Ensure directories exist
 for d in [BIN_DIR, BACKUPS_DIR, EXPORTS_DIR]:
-    os.makedirs(d, exist_ok=True)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+
+
+def clash_config_dir_for(profile_path: str) -> str:
+    """Directory that contains FlClash's ``profiles/`` + ``database.sqlite``.
+
+    The GUI stores ``dirname(profile.yaml)`` which is the ``profiles`` subfolder;
+    profile lookup by name needs the parent folder, so normalise it here.
+    """
+    path = str(profile_path or "").strip()
+    if not path:
+        return ""
+    folder = os.path.dirname(os.path.abspath(path))
+    if os.path.basename(folder).lower() == "profiles":
+        parent = os.path.dirname(folder)
+        if os.path.isdir(os.path.join(parent, "profiles")):
+            return parent
+    return folder
+
+
+def legacy_data_roots() -> list:
+    """Candidate previous installs, newest known-good first.
+
+    Covers both layouts seen in the wild: the old folders *inside* the project
+    directory (``<project>\\release_v1.2``) and *beside* the program folder
+    (``<parent>\\release_v1.2`` when the EXE sits in its own version folder).
+    """
+    parent = os.path.dirname(APP_ROOT.rstrip("\\/")) or APP_ROOT
+    roots = []
+    for name in LEGACY_DIR_NAMES:
+        roots.append(os.path.join(APP_ROOT, name))
+    for name in LEGACY_DIR_NAMES:
+        roots.append(os.path.join(parent, name))
+    roots.append(APP_ROOT)
+    seen = set()
+    result = []
+    for root in roots:
+        if not root:
+            continue
+        key = os.path.normcase(os.path.abspath(root))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(os.path.abspath(root))
+    return result
+
+
+def read_config_file(path: str):
+    """Parsed config dict, or None when the file is missing/broken/empty."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) and data else None
+    except Exception:
+        return None
+
+
+def _copy_missing(src: str, dst: str, copied: dict) -> int:
+    """Copy a file or a directory tree without ever overwriting existing files."""
+    count = 0
+    if os.path.isfile(src):
+        if os.path.exists(dst):
+            return 0
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            return 1
+        except OSError:
+            return 0
+    if not os.path.isdir(src):
+        return 0
+    for base, _dirs, files in os.walk(src):
+        rel = os.path.relpath(base, src)
+        for name in files:
+            source = os.path.join(base, name)
+            target = os.path.join(dst, rel, name) if rel != "." else os.path.join(dst, name)
+            if os.path.exists(target):
+                continue
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(source, target)
+                count += 1
+            except OSError:
+                continue
+    return count
+
+
+def ensure_user_data(migrate: bool = True, data_root: Optional[str] = None,
+                     legacy_roots: Optional[list] = None) -> dict:
+    """Create the data folders and (once) migrate a previous install.
+
+    Guarantees:
+    * an existing valid ``CONFIG_FILE`` is never overwritten;
+    * the source config is copied into ``backups/migration-<ts>/`` first;
+    * everything else is copied, never moved; no source file is deleted;
+    * returns a report the GUI can log (paths only, never secret values).
+
+    ``data_root`` / ``legacy_roots`` exist so the migration can be tested on
+    throw-away folders without touching the real user profile.
+    """
+    root = os.path.abspath(data_root or DATA_ROOT)
+    bin_dir = os.path.join(root, "bin")
+    backups_dir = os.path.join(root, "backups")
+    exports_dir = os.path.join(root, "exports")
+    config_file = os.path.join(root, "config.json")
+    report = {"data_root": root, "status": "existing", "config_source": "",
+              "backup_dir": "", "copied": {}, "warnings": []}
+    for folder in (root, bin_dir, backups_dir, exports_dir):
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as exc:
+            report["warnings"].append(f"创建目录失败 {folder}: {exc}")
+
+    if os.path.isfile(config_file) and read_config_file(config_file):
+        return report
+    if not migrate:
+        report["status"] = "fresh"
+        return report
+
+    source_root = ""
+    source_path = ""
+    source_data = None
+    for candidate_root in (legacy_roots if legacy_roots is not None else legacy_data_roots()):
+        candidate_root = os.path.abspath(str(candidate_root))
+        if os.path.normcase(candidate_root) == os.path.normcase(root):
+            continue
+        candidate = os.path.join(candidate_root, "config.json")
+        data = read_config_file(candidate)
+        if data:
+            source_root, source_path, source_data = candidate_root, candidate, data
+            break
+    if source_data is None:
+        report["status"] = "fresh"
+        return report
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_dir = os.path.join(backups_dir, f"migration-{stamp}")
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        shutil.copy2(source_path, os.path.join(backup_dir, "config.json"))
+        report["backup_dir"] = backup_dir
+    except OSError as exc:
+        report["warnings"].append(f"备份迁移来源失败: {exc}")
+
+    # Keep the profile lookup folder consistent with the real FlClash layout.
+    try:
+        fixed_dir = clash_config_dir_for(str(source_data.get("flclash_profile_path") or ""))
+        if fixed_dir:
+            source_data["flclash_config_dir"] = fixed_dir
+    except Exception:
+        pass
+
+    try:
+        from storage_utils import atomic_write_text
+        atomic_write_text(
+            config_file,
+            json.dumps(source_data, ensure_ascii=False, indent=2) + "\n")
+    except Exception as exc:
+        report["warnings"].append(f"写入新配置失败，继续使用旧目录: {exc}")
+        report["status"] = "failed"
+        return report
+
+    copied = {}
+    for name, target in (("backups", backups_dir), ("exports", exports_dir),
+                         ("bin", bin_dir)):
+        n = _copy_missing(os.path.join(source_root, name), target, copied)
+        if n:
+            copied[name] = n
+    cidr_src = os.path.join(source_root, "cidr_score_history.json")
+    if os.path.isfile(cidr_src):
+        n = _copy_missing(cidr_src, os.path.join(root, "cidr_score_history.json"), copied)
+        if n:
+            copied["cidr_score_history.json"] = n
+    report.update(status="migrated", config_source=source_path, copied=copied)
+
+    try:
+        from storage_utils import atomic_write_text
+        marker = dict(report)
+        marker["migrated_at"] = stamp
+        atomic_write_text(os.path.join(root, MIGRATION_MARKER),
+                          json.dumps(marker, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        pass
+    return report
+
+
+def _normalise_profile_dirs(cfg: dict) -> dict:
+    """Keep ``flclash_config_dir`` at the folder holding profiles/ + database.sqlite.
+
+    Older builds stored ``dirname(profile.yaml)`` (the ``profiles`` subfolder),
+    which made profile lookup by display name silently fail.
+    """
+    try:
+        profile = str(cfg.get("flclash_profile_path") or "").strip()
+        if not profile:
+            return cfg
+        current = str(cfg.get("flclash_config_dir") or "").strip()
+        profile_dir = os.path.dirname(os.path.abspath(profile))
+        if not current or os.path.normcase(os.path.abspath(current)) == os.path.normcase(profile_dir):
+            cfg["flclash_config_dir"] = clash_config_dir_for(profile)
+    except Exception:
+        pass
+    return cfg
 
 
 def load_config() -> dict:
@@ -113,6 +534,11 @@ def load_config() -> dict:
         "airport_us_keywords": ["united states", "\u7f8e\u56fd", "\u7f8e\u897f", "los angeles", "\u6d1b\u6749\u77f6"],
         "airport_max_nodes": 80,
         "chain_landing_node_name": "",
+        # v1.2+ option, persisted so a fresh install already shows it.
+        "direct_landing_node_name": "\U0001f1fa\U0001f1f8 \u6d1b\u6749\u77f6-VPS-\u76f4\u8fde(AI)",
+        # v1.3.1: optional manual dialer-proxy entry for the AI chain node.
+        # "" = automatic (airport front group), else an airport node / group name.
+        "chain_entry_node": "",
         "auto_airport_group_name": "\u26a1 \u673a\u573a\u81ea\u52a8\u4f18\u9009",
         "excluded_node_names": ["CF-\u4fdd\u5e95"],
         "obsolete_group_names": ["\u81ea\u52a8\uff08\u76f4\u8fde\u4f18\u5148\uff09", "\U0001f1fa\U0001f1f8 \u6d1b\u6749\u77f6-CF\u4f18\u9009"],
@@ -134,6 +560,7 @@ def load_config() -> dict:
                 data = json.load(f)
             for k, v in defaults.items():
                 data.setdefault(k, v)
+            _normalise_profile_dirs(data)
             return data
         except Exception:
             pass

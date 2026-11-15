@@ -44,10 +44,12 @@ def dbg(msg):
 dbg("1. main_gui module starting")
 
 import base64
+import io
 import random
 import shutil
 import threading
 import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
@@ -55,10 +57,10 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QSpinBox, QDoubleSpinBox, QLineEdit,
     QTableWidget, QTableWidgetItem, QPlainTextEdit, QHeaderView,
     QComboBox, QProgressBar, QSplitter, QCheckBox, QMessageBox,
-    QFrame, QMenu, QSystemTrayIcon, QFileDialog,
+    QFrame, QMenu, QSystemTrayIcon, QFileDialog, QDialog,
     QScrollArea, QSizePolicy, QToolButton,
 )
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QObject, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QObject, Signal, QSize, QThread
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QFont, QColor, QIcon, QPixmap, QPainter, QBrush, QPen,
@@ -66,10 +68,11 @@ from PySide6.QtGui import (
 )
 
 from path_utils import (
-    APP_ROOT, BIN_DIR, BACKUPS_DIR, EXPORTS_DIR, CFST_EXE,
+    APP_ROOT, BIN_DIR, BACKUPS_DIR, EXPORTS_DIR, CFST_EXE, DATA_ROOT,
     DESKTOP_EXPORT_DIR, load_config, save_config,
     get_app_dir, ensure_app_cwd, is_auto_start_enabled, set_auto_start,
     build_auto_start_command, AUTO_START_KEY_NAME, default_flclash_config_dir,
+    clash_config_dir_for, ensure_user_data, cfst_diagnostics,
 )
 from clash_api import ClashAPI
 from profile_manager import ProfileManager
@@ -85,12 +88,17 @@ from clients import (
 from export_dialog import ExportDialog
 from auto_guard import AutoGuardian
 from lan_server import (
-    ensure_firewall_rule_detailed, firewall_rule_name,
-    ensure_lan_token, generate_token, is_valid_token,
+    ensure_firewall_rule_detailed, firewall_rule_name, firewall_status_summary,
+    ensure_lan_token, generate_token, is_valid_token, lan_self_check,
+    subscription_links, copy_payload, LAN_CLIENT_LINKS,
 )
 from cidr_pool import (
     SubnetScoreStore, ensure_cidr_file, sample_candidates, select_top_ips, subnet_of,
 )
+from config_templates import (
+    DEFAULT_OPTIONS as CT_OPTIONS, chain_entry_candidates,
+)
+from core_test import verify_cfst_binary
 from storage_utils import atomic_write_text
 
 def excepthook(exc_type, exc_value, exc_tb):
@@ -103,6 +111,31 @@ def excepthook(exc_type, exc_value, exc_tb):
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 sys.excepthook = excepthook
+
+
+class LanSelfCheckThread(QThread):
+    """Run the LAN self-check off the GUI thread (it performs real HTTP)."""
+
+    finished_with_result = Signal(dict)
+
+    def __init__(self, port: int, token: str, exports_dir: str, lan_ip: str,
+                 firewall: Optional[dict] = None, parent=None):
+        super().__init__(parent)
+        self._port = int(port or 0)
+        self._token = str(token or "")
+        self._exports_dir = exports_dir
+        self._lan_ip = str(lan_ip or "")
+        self._firewall = firewall
+
+    def run(self):
+        try:
+            result = lan_self_check(self._port, self._token, self._exports_dir,
+                                    lan_ip=self._lan_ip, firewall=self._firewall)
+        except Exception as exc:  # never crash the GUI on a self-check
+            result = {"ok": False, "items": [], "lan": {},
+                      "port": self._port, "token_configured": False,
+                      "urls_masked": [], "error": str(exc)}
+        self.finished_with_result.emit(result)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -549,6 +582,7 @@ class MainWindow(QMainWindow):
         self._lan_port = self.cfg["lan_server_port"]
         self._lan_base_url = ""
         self._lan_urls = []
+        self._lan_links: List[Dict[str, str]] = []
         self._auto_replace = False
         self._guard = None
         self._instance_server = None
@@ -582,6 +616,16 @@ class MainWindow(QMainWindow):
         else:
             self.lan_info_lbl.setText("⏸ 局域网订阅服务已关闭（默认关闭，勾选上方开关可启用）")
         self._update_lan_auth_label()
+        if hasattr(self, "log_text"):
+            diag = cfst_diagnostics()
+            check = verify_cfst_binary(diag.get("chosen") or "")
+            status = ("存在，校验通过" if check.get("ok")
+                      else ("存在" if diag.get("exists") else "缺失"))
+            extra = "" if check.get("ok") else f"；问题: {check.get('error')}"
+            self.log_text.appendPlainText(f"📁 用户数据目录: {DATA_ROOT}")
+            self.log_text.appendPlainText(
+                f"⚙️ 测速核心: {diag.get('chosen')}（{status}, "
+                f"{diag.get('size', 0):,} 字节, {check.get('arch') or '架构未知'}{extra}）")
         if self.cfg.get("auto_guard_enabled"):
             self.guard_chk.setChecked(True)
 
@@ -876,6 +920,29 @@ class MainWindow(QMainWindow):
             bottom_layout.setColumnStretch(col, 1)
         bottom_outer.addLayout(bottom_layout)
 
+        # ── AI 链路入口节点（dialer-proxy）手动选择 ──
+        entry_row = QHBoxLayout()
+        entry_lbl = QLabel("🔗 AI 链路入口（前置跳板）:")
+        entry_lbl.setStyleSheet("font-size: 11px; color: #37474F;")
+        entry_row.addWidget(entry_lbl)
+        self.chain_entry_combo = QComboBox()
+        self.chain_entry_combo.setMinimumWidth(320)
+        self.chain_entry_combo.setToolTip(
+            "链式落地节点 🇺🇸 洛杉矶-VPS-链式落地(AI) 的 dialer-proxy。\n"
+            "自动 = 机场前置优选组（始终使用机场池里延迟最低的节点）。\n"
+            "也可以指定某个机场节点或 日常-机场节点 策略组作为固定前置跳板。\n"
+            "修改后需要重新点击「应用多端优化拓扑」才会写入配置。")
+        self.chain_entry_combo.currentIndexChanged.connect(self._on_chain_entry_changed)
+        entry_row.addWidget(self.chain_entry_combo, 1)
+        self.chain_entry_refresh_btn = QToolButton()
+        self.chain_entry_refresh_btn.setText("🔄")
+        self.chain_entry_refresh_btn.setToolTip("重新读取机场订阅，刷新入口节点列表")
+        self.chain_entry_refresh_btn.clicked.connect(
+            lambda: self._refresh_chain_entry_choices(refresh=True))
+        entry_row.addWidget(self.chain_entry_refresh_btn)
+        bottom_outer.addLayout(entry_row)
+        self._refresh_chain_entry_choices()
+
         lan_row = QHBoxLayout()
         self.lan_chk = QCheckBox("启用局域网 HTTP 订阅服务")
         self.lan_chk.setToolTip(
@@ -899,14 +966,53 @@ class MainWindow(QMainWindow):
         self.rotate_token_btn.clicked.connect(self._rotate_lan_token)
         lan_row.addWidget(self.rotate_token_btn)
 
-        self.copy_lan_btn = QPushButton("📋 复制订阅链接")
-        self.copy_lan_btn.setStyleSheet("padding: 4px; background: #1565C0; color: white; border-radius: 4px;")
-        self.copy_lan_btn.setToolTip("复制 4 条带 Token 的订阅地址（FlClash / iOS / Happ / Happ JSON）")
-        self.copy_lan_btn.setEnabled(False)
-        self.copy_lan_btn.clicked.connect(self._copy_lan_links)
-        lan_row.addWidget(self.copy_lan_btn)
+        self.lan_check_btn = QPushButton("🧪 局域网自检")
+        self.lan_check_btn.setStyleSheet("padding: 4px; background: #00695C; color: white; border-radius: 4px;")
+        self.lan_check_btn.setToolTip(
+            "检查服务监听、局域网 IP、防火墙规则、Token 状态，并实际请求 4 个订阅接口验证 YAML 可解析")
+        self.lan_check_btn.clicked.connect(self._run_lan_self_check)
+        lan_row.addWidget(self.lan_check_btn)
         lan_row.addStretch()
         bottom_outer.addLayout(lan_row)
+
+        # ── 4 个客户端订阅链接（v1.3.2：明文展示 + 单条复制 + 单条二维码） ──
+        self.lan_links_layout = QGridLayout()
+        self.lan_links_layout.setHorizontalSpacing(6)
+        self.lan_links_layout.setVerticalSpacing(3)
+        self.lan_link_edits: List[QLineEdit] = []
+        self.lan_copy_btns: List[QPushButton] = []
+        self.lan_qr_btns: List[QPushButton] = []
+        for row_index, (label_text, _path) in enumerate(LAN_CLIENT_LINKS):
+            name_lbl = QLabel(label_text)
+            name_lbl.setStyleSheet("font-size: 11px; color: #37474F;")
+            name_lbl.setMinimumWidth(150)
+            edit = QLineEdit("")
+            edit.setReadOnly(True)
+            edit.setPlaceholderText("启用局域网服务后显示明文订阅链接")
+            edit.setStyleSheet("font-size: 11px;")
+            edit.setToolTip("明文完整链接：可直接核对 IP / 端口 / Token / 文件名，也支持手动选择复制")
+            edit.setCursorPosition(0)
+            copy_btn = QPushButton("📋 复制")
+            copy_btn.setStyleSheet(
+                "padding: 2px 8px; background: #1565C0; color: white; border-radius: 4px; font-size: 11px;")
+            copy_btn.setToolTip(f"仅复制 {label_text} 的一条纯 URL 到剪贴板")
+            copy_btn.setEnabled(False)
+            copy_btn.clicked.connect(lambda _=False, i=row_index: self._copy_lan_link(i))
+            qr_btn = QPushButton("🔳 二维码")
+            qr_btn.setStyleSheet(
+                "padding: 2px 8px; background: #455A64; color: white; border-radius: 4px; font-size: 11px;")
+            qr_btn.setToolTip(f"查看 {label_text} 单条链接的二维码")
+            qr_btn.setEnabled(False)
+            qr_btn.clicked.connect(lambda _=False, i=row_index: self._show_lan_qr(i))
+            self.lan_link_edits.append(edit)
+            self.lan_copy_btns.append(copy_btn)
+            self.lan_qr_btns.append(qr_btn)
+            self.lan_links_layout.addWidget(name_lbl, row_index, 0)
+            self.lan_links_layout.addWidget(edit, row_index, 1)
+            self.lan_links_layout.addWidget(copy_btn, row_index, 2)
+            self.lan_links_layout.addWidget(qr_btn, row_index, 3)
+        self.lan_links_layout.setColumnStretch(1, 1)
+        bottom_outer.addLayout(self.lan_links_layout)
 
         self.lan_auth_lbl = QLabel("🔐 访问认证：未启用（开启服务时自动生成高强度 Token）")
         self.lan_auth_lbl.setStyleSheet("font-size: 11px; color: #6A1B9A; padding: 2px;")
@@ -1228,7 +1334,9 @@ class MainWindow(QMainWindow):
             return
 
         self.cfg["flclash_profile_path"] = path
-        self.cfg["flclash_config_dir"] = os.path.dirname(path)
+        # Store the folder that actually holds profiles/ + database.sqlite, not
+        # the profiles subfolder (profile lookup by name needs the parent).
+        self.cfg["flclash_config_dir"] = clash_config_dir_for(path)
         self.cfg["client_type"] = self.client_combo.currentData() or "auto"
         self.cfg["external_controller"] = api
         self.cfg["secret"] = secret
@@ -1251,12 +1359,73 @@ class MainWindow(QMainWindow):
             self._start_guard()
         self._refresh_node_cards()
         self._refresh_client_choices()
+        self._refresh_chain_entry_choices()
         self._update_client_summary()
         self.client_status_lbl.setText(
             f"✅ 已应用: {os.path.basename(path)}  ·  API http://{api}")
         self.statusBar().showMessage(f"客户端配置已更新: {path}")
         self.log_text.appendPlainText(
             f"🔌 已切换到配置: {path}\n🔌 外部控制 API: http://{api}")
+
+    def _refresh_chain_entry_choices(self, refresh: bool = False):
+        """Fill the AI chain-entry combo from the configured airport source."""
+        combo = getattr(self, "chain_entry_combo", None)
+        if combo is None:
+            return
+        airport = str(self.cfg.get("airport_profile_path") or "").strip()
+        names: List[str] = []
+        if airport:
+            try:
+                names = chain_entry_candidates(airport, self.cfg)
+            except Exception as exc:
+                dbg(f"chain entry candidates: {exc}")
+                names = []
+        front = str(self.cfg.get("front_group_name") or CT_OPTIONS["front_group_name"])
+        daily = str(self.cfg.get("daily_group_name") or CT_OPTIONS["daily_group_name"])
+        self._syncing_chain_entry = True
+        try:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("自动（跟随机场前置优选组 ✈️ 机场前置优选）", "")
+            combo.addItem(f"✈️ 策略组：{front}", front)
+            combo.addItem(f"🚀 策略组：{daily}", daily)
+            for name in names:
+                combo.addItem(f"🛫 机场节点：{name}", name)
+            current = str(self.cfg.get("chain_entry_node") or "").strip()
+            index = combo.findData(current)
+            if index < 0:
+                combo.addItem(f"⚠ 未在当前机场中：{current}", current)
+                index = combo.count() - 1
+            combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+        finally:
+            self._syncing_chain_entry = False
+        if hasattr(self, "chain_entry_combo"):
+            self.chain_entry_combo.setToolTip(
+                "链式落地节点 🇺🇸 洛杉矶-VPS-链式落地(AI) 的 dialer-proxy。\n"
+                "自动 = 机场前置优选组（机场池内自动选优）。\n"
+                f"当前可选机场节点 {len(names)} 个（来源: {airport or '未配置机场订阅'}）。\n"
+                "修改后需重新点击「应用多端优化拓扑」才会写入。")
+
+    def _on_chain_entry_changed(self, index: int):
+        if getattr(self, "_syncing_chain_entry", False):
+            return
+        combo = getattr(self, "chain_entry_combo", None)
+        if combo is None:
+            return
+        value = str(combo.itemData(index) or "").strip()
+        if value == str(self.cfg.get("chain_entry_node") or "").strip():
+            return
+        self.cfg["chain_entry_node"] = value
+        try:
+            save_config(self.cfg)
+        except Exception as exc:
+            self.statusBar().showMessage(f"⚠ AI 链路入口保存失败: {exc}")
+            return
+        label = combo.currentText()
+        self.log_text.appendPlainText(
+            f"🔗 AI 链路入口已设为: {label}（重新「应用多端优化拓扑」后生效）")
+        self.statusBar().showMessage(f"AI 链路入口已保存: {label}")
 
     def _refresh_node_cards(self):
         """Refresh node card info from YAML."""
@@ -1300,18 +1469,19 @@ class MainWindow(QMainWindow):
             ensure_firewall=True,
             token_provider=lambda: self.cfg.get("lan_auth_token", ""),
             remote_scope=self.cfg.get("lan_firewall_remote", "LocalSubnet"),
+            access_log_path=os.path.join(DATA_ROOT, "logs", "lan_access.log"),
         )
         self._lan_server.started.connect(self._on_lan_started)
         self._lan_server.warning.connect(lambda msg: self.statusBar().showMessage(msg))
         self._lan_server.firewall.connect(self._on_firewall_status)
         self._lan_server.error.connect(self._on_lan_error)
+        self._lan_server.access_logged.connect(self._on_lan_access)
         self._lan_server.start()
         if hasattr(self, "firewall_lbl"):
             self.firewall_lbl.setText("🛡️ 防火墙规则检查中...")
         if hasattr(self, "lan_info_lbl"):
             self.lan_info_lbl.setText("🌐 局域网订阅服务启动中…（Token 认证已启用）")
-        if hasattr(self, "copy_lan_btn"):
-            self.copy_lan_btn.setEnabled(False)
+        self._set_lan_link_state(False)
         self._update_lan_auth_label()
 
     def _regenerate_exports(self, silent: bool = False):
@@ -1326,14 +1496,38 @@ class MainWindow(QMainWindow):
                 and bool(getattr(self._lan_server, "actual_port", 0)))
 
     def _refresh_lan_urls(self):
-        """Build the four token-bearing subscription URLs (kept out of logs)."""
+        """Build the four per-client plaintext links and mirror them into the UI."""
         token = str(self.cfg.get("lan_auth_token") or "")
         if not self._lan_base_url or not is_valid_token(token):
+            self._lan_links = []
             self._lan_urls = []
+        else:
+            self._lan_links = subscription_links(self._lan_base_url, token)
+            self._lan_urls = [link["url"] for link in self._lan_links]
+        self._sync_lan_link_widgets()
+
+    def _sync_lan_link_widgets(self):
+        edits = getattr(self, "lan_link_edits", None)
+        if edits is None:
             return
-        base = f"{self._lan_base_url}/s/{token}"
-        self._lan_urls = [f"{base}/{name}" for name in
-                          ("flclash.yaml", "ios.yaml", "tv_happ.txt", "happ.json")]
+        running = self._lan_is_running()
+        for index, edit in enumerate(edits):
+            url = self._lan_links[index]["url"] if index < len(self._lan_links) else ""
+            if edit.text() != url:
+                edit.setText(url)
+                edit.setCursorPosition(0)
+            edit.setEnabled(bool(url))
+        for buttons in (getattr(self, "lan_copy_btns", []),
+                        getattr(self, "lan_qr_btns", [])):
+            for index, button in enumerate(buttons):
+                has_link = index < len(self._lan_links) and bool(self._lan_links[index]["url"])
+                button.setEnabled(bool(running and has_link))
+
+    def _set_lan_link_state(self, enabled: bool):
+        if not enabled:
+            self._lan_links = []
+            self._lan_urls = []
+        self._sync_lan_link_widgets()
 
     def _update_lan_auth_label(self):
         if not hasattr(self, "lan_auth_lbl"):
@@ -1352,19 +1546,84 @@ class MainWindow(QMainWindow):
         self._lan_port = int(port)
         self._lan_base_url = f"http://{ip}:{port}"
         self._refresh_lan_urls()
-        masked = (f"{self._lan_base_url}/s/••••••••/ios.yaml  ·  "
-                  f"{self._lan_base_url}/s/••••••••/tv_happ.txt  ·  "
-                  f"{self._lan_base_url}/s/••••••••/happ.json")
-        text = (f"🌐 局域网订阅就绪: {masked}"
-                f"（🔐 Token 认证，点击「复制订阅链接」获取完整地址）")
+        tv_url = next((link["url"] for link in self._lan_links
+                       if link["path"] == "tv_happ.txt"), self._lan_base_url)
+        # v1.3.2: no masking here — the four full links are shown just below.
+        text = (f"🌐 局域网订阅就绪（明文链接，可逐条复制）: {tv_url} 等 4 条"
+                f"（🔐 Token 认证，未认证请求返回 404）")
         if hasattr(self, "lan_info_lbl"):
             self.lan_info_lbl.setText(text)
         self.statusBar().showMessage(
-            f"局域网订阅服务运行中: http://{ip}:{port}/s/…/ios.yaml（Token 认证）")
+            f"局域网订阅服务运行中: {self._lan_base_url}（明文链接见下方 4 条）")
         if hasattr(self, "log_text"):
             self.log_text.appendPlainText(text)
-        if hasattr(self, "copy_lan_btn"):
-            self.copy_lan_btn.setEnabled(bool(self._lan_urls))
+        self._sync_lan_link_widgets()
+        self._update_lan_auth_label()
+
+    def _on_lan_access(self, line: str):
+        """Show one masked access line in the GUI run log."""
+        if hasattr(self, "log_text") and line:
+            self.log_text.appendPlainText(str(line))
+
+    def _copy_lan_link(self, index: int):
+        """Copy EXACTLY one plain URL (no label, no newline) to the clipboard."""
+        if index < 0 or index >= len(getattr(self, "_lan_links", [])):
+            self.statusBar().showMessage("订阅链接尚未生成，请先启用局域网订阅服务")
+            return
+        link = self._lan_links[index]
+        payload = copy_payload(link)
+        if not payload:
+            self.statusBar().showMessage("订阅链接为空，请检查 Token 配置")
+            return
+        QApplication.clipboard().setText(payload)
+        self.statusBar().showMessage(f"已复制 {link['label']} 订阅链接（单条 URL）")
+
+    def _show_lan_qr(self, index: int):
+        if index < 0 or index >= len(getattr(self, "_lan_links", [])):
+            self.statusBar().showMessage("订阅链接尚未生成，请先启用局域网订阅服务")
+            return
+        link = self._lan_links[index]
+        try:
+            import qrcode
+            qr = qrcode.QRCode(version=1, box_size=8, border=2,
+                               error_correction=qrcode.constants.ERROR_CORRECT_L)
+            qr.add_data(link["url"])
+            qr.make(fit=True)
+            image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            pixmap = QPixmap()
+            pixmap.loadFromData(buffer.getvalue(), "PNG")
+        except Exception as exc:
+            QMessageBox.warning(self, "二维码生成失败", f"{link['label']}: {exc}")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{link['label']} 订阅二维码")
+        layout = QVBoxLayout(dialog)
+        image_label = QLabel()
+        image_label.setPixmap(pixmap)
+        image_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(image_label)
+        url_label = QLabel(link["url"])
+        url_label.setWordWrap(True)
+        url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        url_label.setStyleSheet("font-size: 10px; color: #455A64;")
+        layout.addWidget(url_label)
+        hint = QLabel("手机扫码即可导入该订阅（需与本机同一 Wi-Fi；更新前请先关闭手机端代理）")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 10px; color: #00695C;")
+        layout.addWidget(hint)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.exec()
+
+    def _copy_lan_link_checked(self, index: int) -> str:
+        """Test helper: what the copy button would place on the clipboard."""
+        links = getattr(self, "_lan_links", [])
+        if index < 0 or index >= len(links):
+            return ""
+        return copy_payload(links[index])
         self._update_lan_auth_label()
 
     def _stop_lan_server(self):
@@ -1375,9 +1634,7 @@ class MainWindow(QMainWindow):
                 pass
             self._lan_server = None
         self._lan_base_url = ""
-        self._lan_urls = []
-        if hasattr(self, "copy_lan_btn"):
-            self.copy_lan_btn.setEnabled(False)
+        self._set_lan_link_state(False)
         if hasattr(self, "lan_info_lbl"):
             self.lan_info_lbl.setText("⏸ 局域网订阅服务已关闭（订阅地址当前不可访问）")
         if hasattr(self, "firewall_lbl"):
@@ -1396,13 +1653,6 @@ class MainWindow(QMainWindow):
             self._stop_lan_server()
             self.statusBar().showMessage("局域网订阅服务已关闭")
         self._sync_tray_menu()
-
-    def _copy_lan_links(self):
-        if not self._lan_urls:
-            self.statusBar().showMessage("请先启用局域网订阅服务，再复制订阅链接")
-            return
-        QApplication.clipboard().setText("\n".join(self._lan_urls))
-        self.statusBar().showMessage("已复制 4 条带 Token 的订阅链接（请勿公开分享）")
 
     def _rotate_lan_token(self):
         answer = QMessageBox.question(
@@ -1423,10 +1673,9 @@ class MainWindow(QMainWindow):
             self._refresh_lan_urls()
             self._on_lan_started(self._lan_ip, self._lan_port)
         else:
-            self._lan_urls = []
+            self._lan_links = []
+            self._set_lan_link_state(False)
             self._update_lan_auth_label()
-            if hasattr(self, "copy_lan_btn"):
-                self.copy_lan_btn.setEnabled(False)
         QMessageBox.information(
             self, "Token 已更新",
             "新的访问 Token 已生成并立即生效。\n"
@@ -1462,13 +1711,73 @@ class MainWindow(QMainWindow):
 
     def _on_lan_error(self, msg: str):
         self._lan_base_url = ""
-        self._lan_urls = []
-        if hasattr(self, "copy_lan_btn"):
-            self.copy_lan_btn.setEnabled(False)
+        self._set_lan_link_state(False)
         if hasattr(self, "lan_info_lbl"):
             self.lan_info_lbl.setText(f"⚠ 局域网订阅服务异常: {msg}")
         self._update_lan_auth_label()
         self.statusBar().showMessage(f"局域网订阅服务错误: {msg}")
+
+    def _run_lan_self_check(self):
+        """Real end-to-end LAN check (service, firewall, token, endpoints)."""
+        if not self._lan_is_running():
+            QMessageBox.information(
+                self, "局域网自检",
+                "局域网订阅服务当前未运行。\n\n请先勾选「启用局域网 HTTP 订阅服务」，"
+                "再点击本按钮自检。")
+            return
+        port = int(self._lan_port or self.cfg.get("lan_server_port", 8686))
+        self.statusBar().showMessage("🧪 局域网自检中（会实际请求 4 个订阅接口）…")
+        self.lan_check_btn.setEnabled(False)
+        self._selfcheck_thread = LanSelfCheckThread(
+            port, str(self.cfg.get("lan_auth_token") or ""), EXPORTS_DIR,
+            str(self._lan_ip or ""), firewall=firewall_status_summary(port),
+            parent=self)
+        self._selfcheck_thread.finished_with_result.connect(self._show_lan_selfcheck)
+        self._selfcheck_thread.finished.connect(
+            lambda: self.lan_check_btn.setEnabled(True))
+        self._selfcheck_thread.start()
+
+    def _show_lan_selfcheck(self, result: dict):
+        items = result.get("items") or []
+        lines = []
+        for item in items:
+            lines.append(("✅ " if item.get("ok") else "❌ ")
+                         + str(item.get("label") or item.get("key"))
+                         + (" — " + str(item.get("detail")) if item.get("detail") else ""))
+        lan = result.get("lan") or {}
+        head = [
+            "服务: " + ("运行中" if self._lan_is_running() else "未运行")
+            + f" · 端口 {result.get('port')}",
+            "局域网 IP: " + str(lan.get("ip") or "未知")
+            + ("（网卡 " + str(lan.get("alias")) + "）" if lan.get("alias") else ""),
+            "Token: " + ("已配置（不显示内容）" if result.get("token_configured") else "未配置"),
+            "",
+        ]
+        if result.get("error"):
+            head.append("⚠ 自检异常: " + str(result["error"]))
+        if result.get("request_host"):
+            head.append("自检请求地址: http://" + str(result["request_host"])
+                        + ":" + str(result.get("port")) + "/s/…")
+        text = "\n".join(head + lines)
+        urls = result.get("urls_masked") or []
+        if urls:
+            text += "\n\n订阅地址（Token 已打码，真实链接请用「复制订阅链接」）:\n  " + "\n  ".join(urls)
+        tips = result.get("tips") or []
+        if tips:
+            text += "\n\n手机连接提示:\n  - " + "\n  - ".join(str(t) for t in tips)
+        if not result.get("ok"):
+            text += ("\n\n排查建议:\n"
+                     "1) 手机与电脑连同一个 Wi-Fi（不要用访客网络/AP 隔离）\n"
+                     "2) 点「一键放行防火墙端口」后重试自检\n"
+                     "3) 若刚点过「重新生成 Token」，手机需重新添加订阅地址")
+        self.log_text.appendPlainText("🧪 局域网自检结果:\n" + text)
+        box = QMessageBox(self)
+        box.setWindowTitle("局域网自检" + ("：全部通过" if result.get("ok") else "：发现问题"))
+        box.setIcon(QMessageBox.Information if result.get("ok") else QMessageBox.Warning)
+        box.setText(text)
+        box.exec()
+        self.statusBar().showMessage(
+            "局域网自检完成: " + ("全部通过" if result.get("ok") else "发现问题（见弹窗/日志）"))
 
     # ── Background auto guardian ──────────────────────────────
     def _build_guard(self):
@@ -1994,7 +2303,54 @@ class MainWindow(QMainWindow):
 
     # ── Optimized topology (chain proxy / IPv6 / mux) ───────────
     def _apply_topology(self):
-        """Write the chained-airport + streaming/AI + IPv6-hardened topology."""
+        """Write the chained-airport + streaming/AI + IPv6-hardened topology.
+
+        Everything is checked *before* the first byte is written:
+        the target must exist, must differ from the airport subscription file,
+        the CF nodes must be recognised and the chain + direct nodes must be
+        buildable.  A failed check never touches the profile.
+        """
+        try:
+            pre = self.profile_mgr.topology_preflight()
+        except Exception as exc:
+            QMessageBox.critical(self, "应用优化拓扑失败",
+                                 f"预检查失败，未修改任何文件：\n{exc}")
+            self.log_text.appendPlainText(f"⛔ 拓扑预检查异常（未写入）: {exc}")
+            return
+
+        facts = [
+            f"目标工作配置: {pre.get('target', '')}",
+            f"机场订阅来源: {pre.get('airport') or '（未配置）'}",
+            f"CF 优选节点: {len(pre.get('cf_nodes') or [])} 个",
+            f"机场节点合并: {pre.get('airport_nodes', 0)} 个",
+            f"VPS 落地节点: {pre.get('landing_node') or '未识别'}",
+            f"AI 链路入口: {pre.get('chain_entry') or '未设置'}",
+            f"链式节点: {pre.get('chain_node') or '未创建'}",
+            f"直连节点: {pre.get('direct_node') or '未创建'}",
+        ]
+        if not pre.get("ok"):
+            problems = pre.get("problems") or ["未知原因"]
+            self.log_text.appendPlainText(
+                "⛔ 已阻止写入（防护检查未通过，配置文件未被修改）:\n  - "
+                + "\n  - ".join(problems))
+            QMessageBox.critical(
+                self, "禁止写入：目标配置不安全",
+                "以下检查未通过，本次没有修改任何文件：\n\n- "
+                + "\n- ".join(problems)
+                + "\n\n" + "\n".join(facts))
+            return
+
+        answer = QMessageBox.question(
+            self, "确认写入优化拓扑",
+            "即将写入以下文件（会先自动备份）：\n\n" + "\n".join(facts)
+            + "\n\n🤖 AI 组: " + " → ".join(pre.get("ai_members") or [])
+            + "\n🚀 PROXY: " + " → ".join(pre.get("proxy_members") or [])
+            + "\n\n继续吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            self.log_text.appendPlainText("ℹ 已取消写入优化拓扑（未修改任何文件）")
+            return
+
         try:
             summary = self.profile_mgr.apply_optimized_topology()
             # Persist resolved airport identity + merged node list so a future
@@ -2015,6 +2371,7 @@ class MainWindow(QMainWindow):
 
             self.profile_mgr.load()
             self._refresh_node_cards()
+            self._refresh_chain_entry_choices()
             try:
                 self._regenerate_exports(silent=False)
             except Exception as exc:
@@ -2029,6 +2386,9 @@ class MainWindow(QMainWindow):
                 f"流媒体 url-test: {summary.get('stream_group') or '未创建'}",
                 f"机场前置组: {summary.get('front_group') or '未创建'}",
                 f"AI 链式落地: {summary.get('chain_node') or '未创建'}",
+                f"VPS 直连节点: {summary.get('direct_node') or '未创建'}",
+                f"AI 组成员: {' → '.join(summary.get('ai_group_members') or []) or '未创建'}",
+                f"PROXY 成员: {' → '.join(summary.get('proxy_members') or [])}",
                 f"分流规则更新: {summary.get('rules_touched', 0)} 条",
                 f"备份: {summary.get('backup', '')}",
                 f"热重载: {'✅ 成功' if reloaded else '未生效（下次启动生效）'}",
@@ -2308,6 +2668,23 @@ def main(argv=None):
     ensure_app_cwd()
     dbg(f"2a. working directory forced to {os.getcwd()}")
     try:
+        # Move/locate user data in the fixed AppData folder (v1.3). Runs before
+        # any config read; never overwrites an existing config and keeps a copy
+        # of whatever it migrated.
+        try:
+            migration = ensure_user_data()
+            dbg(f"2b. user data root={migration.get('data_root')} "
+                f"status={migration.get('status')} "
+                f"source={migration.get('config_source') or '-'}")
+            if migration.get("status") == "migrated":
+                dbg(f"2c. migrated legacy data: {migration.get('copied')} "
+                    f"backup={migration.get('backup_dir')}")
+            for warning in migration.get("warnings") or []:
+                dbg(f"2d. migration warning: {warning}")
+        except Exception as exc:
+            dbg(f"2b. user data migration skipped: {exc}")
+        dbg(f"2e. data_root={DATA_ROOT} cfst={CFST_EXE} "
+            f"cfst_exists={os.path.isfile(CFST_EXE)}")
         app = QApplication(argv)
         dbg("3. QApplication created")
         # Second launch: tell the running instance to raise its window, then leave.

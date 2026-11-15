@@ -13,7 +13,10 @@ The generated topology contains:
   * ``✈️ 机场前置优选``        url-test over the airport's US / low-latency nodes;
   * ``🇺🇸 洛杉矶-VPS-链式落地(AI)`` a copy of the Los Angeles VPS node carrying
     ``dialer-proxy: "✈️ 机场前置优选"``, i.e. local -> airport front -> LA VPS;
-  * ``🤖 AI-链式落地``         selector exposing the chain node with a CF fallback;
+  * ``🇺🇸 洛杉矶-VPS-直连(AI)``  the same VPS copy with ``dialer-proxy`` removed,
+    i.e. local -> LA VPS directly (manual choice, not failover);
+  * ``🤖 AI-链式落地``         selector exposing chain node (1st) and direct node
+    (2nd), both optional when the VPS landing cannot be built;
   * ``🚀 日常-机场节点``       default airport group for ordinary overseas traffic;
   * hardened DNS/transport: ``ipv6: false``, ``dns.ipv6: false``,
     ``dns.enhanced-mode: fake-ip`` and ``mux.enabled: false`` on every CF node,
@@ -49,6 +52,8 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
     "obsolete_group_names": ["自动（直连优先）", "🇺🇸 洛杉矶-CF优选"],
     "ai_chain_group_name": "🤖 AI-链式落地",
     "ai_chain_node_name": "🇺🇸 洛杉矶-VPS-链式落地(AI)",
+    # Twin of the chain node without dialer-proxy: same VPS, no airport front.
+    "direct_landing_node_name": "🇺🇸 洛杉矶-VPS-直连(AI)",
     "legacy_cf_group": "🇺🇸 洛杉矶-CF优选",
     "main_group_name": "PROXY",
     "chain_landing_node_name": "",
@@ -425,6 +430,242 @@ def _build_chain_node(landing: Dict[str, Any], options: Dict[str, Any],
     return node
 
 
+# Built-in policy targets: a proxy must never be named like one of these.
+RESERVED_TARGET_NAMES = frozenset({
+    "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL", "PROXY"})
+
+
+def _blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def vless_node_problem(node: Any) -> str:
+    """Return why *node* cannot be used as a VLESS landing ("" when valid)."""
+    if not isinstance(node, dict):
+        return "节点不存在"
+    kind = str(node.get("type") or "").strip().lower()
+    if kind != "vless":
+        return f"type={kind or '(空)'} 不是 vless"
+    for key in ("server", "uuid"):
+        if _blank(node.get(key)):
+            return f"缺少必要字段 {key}"
+    port = node.get("port")
+    if _blank(port):
+        return "缺少必要字段 port"
+    try:
+        if not 0 < int(port) < 65536:
+            return f"port 越界: {port!r}"
+    except (TypeError, ValueError):
+        return f"port 非整数: {port!r}"
+    return ""
+
+
+def _node_signature(node: Any) -> str:
+    """Canonical signature of the parts that define a connection.
+
+    ``name`` and ``dialer-proxy`` are excluded on purpose: they are the only two
+    keys allowed to differ between the chain node and its direct twin.
+    """
+    if not isinstance(node, dict):
+        return ""
+    try:
+        data = to_builtin(copy.deepcopy(dict(node)))
+    except Exception:
+        return ""
+    data.pop("name", None)
+    data.pop("dialer-proxy", None)
+    return json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _derived_from(node: Any, expected: Dict[str, Any]) -> bool:
+    """True when *node* is a copy of the same VPS the direct node derives from.
+
+    A name-only marker is deliberately not written into the YAML (the spec
+    requires the twin to differ from the chain node in ``name`` /
+    ``dialer-proxy`` alone), so ownership is proved by the connection identity
+    instead: identical parameters, or the same type/server/port/uuid.
+    """
+    if not isinstance(node, dict):
+        return False
+    if _node_signature(node) == _node_signature(expected):
+        return True
+    for key in ("type", "server", "port", "uuid"):
+        left, right = node.get(key), expected.get(key)
+        if _blank(left) or str(left).strip().lower() != str(right).strip().lower():
+            return False
+    return True
+
+
+def generated_node_names(options: Dict[str, Any]) -> set:
+    """Names this program creates itself (never valid landing candidates)."""
+    return {str(options.get(key) or "").strip()
+            for key in ("ai_chain_node_name", "direct_landing_node_name")
+            if str(options.get(key) or "").strip()}
+
+
+def landing_candidates(proxies: Any, options: Dict[str, Any]) -> List[Any]:
+    """Nodes that could be the original VPS landing (keyword scan, no guessing).
+
+    Program-generated nodes (chain / direct twin) are excluded: a previous run
+    writes them into the profile, and their names contain "VPS" too, so keeping
+    them would make every later run ambiguous.
+    """
+    skip = generated_node_names(options)
+    return [p for p in (proxies or [])
+            if isinstance(p, dict)
+            and str(p.get("name", "")).strip() not in skip
+            and _matches_any(str(p.get("name", "")), ("reality", "vps"))]
+
+
+def chain_entry_candidates(airport_path: str, options: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Airport node names usable as the AI chain dialer-proxy entry.
+
+    Info/ad nodes (traffic, expiry, website …) and program-generated nodes are
+    filtered out; the order of the airport file is preserved and duplicates are
+    collapsed.
+    """
+    opts = merged_options(options)
+    skip = generated_node_names(opts)
+    names: List[str] = []
+    for node in load_airport_nodes(str(airport_path or ""), opts, []):
+        if not isinstance(node, dict):
+            continue
+        name = str(node.get("name", "")).strip()
+        if not name or name in skip:
+            continue
+        if _matches_any(name, opts.get("airport_exclude_keywords") or []):
+            continue
+        names.append(name)
+    return list(dict.fromkeys(names))
+
+
+def resolve_chain_entry(requested: Any, proxies: Any, options: Dict[str, Any],
+                        summary: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """Resolve ``chain_entry_node`` to the dialer-proxy target.
+
+    ``""`` (automatic) keeps the validated behaviour: the airport front group.
+    A configured value must be an existing proxy name or one of the program's
+    policy groups; otherwise the front group is used as a safe fallback and the
+    reason is reported (the GUI preflight blocks the write in that case).
+    Returns ``(target, problem)`` where ``problem`` is ``""`` when everything is
+    in order.
+    """
+    opts = merged_options(options)
+    summary = summary if summary is not None else {}
+    warnings = summary.setdefault("warnings", [])
+    requested = str(requested or "").strip()
+    fallback = str(opts["front_group_name"])
+    if not requested:
+        return fallback, ""
+    skip = generated_node_names(opts)
+    if requested in skip:
+        problem = (f"AI 链路入口 {requested!r} 是本程序生成的节点，不能作为前置跳板，"
+                   f"已回退到 {fallback}")
+        warnings.append(problem)
+        return fallback, problem
+    group_targets = {str(opts[key]) for key in
+                     ("front_group_name", "daily_group_name",
+                      "auto_airport_group_name", "main_group_name")}
+    proxy_names = {str(p.get("name")) for p in (proxies or []) if isinstance(p, dict)}
+    if requested in proxy_names or requested in group_targets:
+        return requested, ""
+    problem = (f"AI 链路入口 {requested!r} 不在目标配置的节点/策略组中，"
+               f"已回退到 {fallback}；请重新选择入口节点后再写入")
+    warnings.append(problem)
+    return fallback, problem
+
+
+def resolve_landing_node(proxies: Any, options: Dict[str, Any],
+                         summary: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    """Locate the original VPS landing node.
+
+    ``chain_landing_node_name`` is authoritative.  The legacy keyword scan
+    (``reality`` / ``vps`` in the name) stays as a fallback only, and refuses to
+    guess when several candidates match: promoting an airport node to "the VPS"
+    would silently build a wrong chain.
+    """
+    summary = summary if summary is not None else {}
+    warnings = summary.setdefault("warnings", [])
+    skip = generated_node_names(options)
+    configured = str(options.get("chain_landing_node_name") or "").strip()
+    if configured and configured in skip:
+        warnings.append(
+            f"chain_landing_node_name={configured!r} 是本程序生成的节点，不能当作原始 VPS 落地节点，"
+            "改用名称兜底识别")
+        configured = ""
+    if configured:
+        node = find_proxy(proxies, configured)
+        if node is not None:
+            return node
+        warnings.append(f"配置的 VPS 落地节点 {configured!r} 不在当前配置中，改用名称兜底识别")
+    candidates = landing_candidates(proxies, options)
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        preferred = [p for p in candidates if not vless_node_problem(p)]
+        if len(preferred) != 1:
+            warnings.append(
+                "名称兜底识别命中 %d 个候选 VPS 节点（%s），无法确定唯一落地节点，"
+                "已跳过链式/直连节点生成"
+                % (len(candidates),
+                   ", ".join(str(p.get("name")) for p in candidates[:4])))
+            return None
+        candidates = preferred
+    return candidates[0]
+
+
+def _upsert_direct_node(proxies: CommentedSeq, chain_node: Dict[str, Any],
+                        options: Dict[str, Any],
+                        summary: Dict[str, Any]) -> str:
+    """Install the no-dialer-proxy twin of *chain_node*; idempotent.
+
+    Returns the name actually installed, or "" when it was skipped (reserved
+    name, or a foreign node already owning that name).  Never touches the
+    landing node, the chain node, or a user node.
+    """
+    direct_name = str(options.get("direct_landing_node_name") or "").strip()
+    if not direct_name:
+        summary["warnings"].append("direct_landing_node_name 为空，跳过 VPS 直连节点")
+        return ""
+    if direct_name in RESERVED_TARGET_NAMES:
+        summary["warnings"].append(
+            f"direct_landing_node_name={direct_name!r} 与内置策略目标同名，跳过 VPS 直连节点")
+        return ""
+
+    expected = copy.deepcopy(chain_node)
+    expected.pop("dialer-proxy", None)
+    expected["name"] = direct_name
+
+    existing = [idx for idx, proxy in enumerate(proxies)
+                if isinstance(proxy, dict) and str(proxy.get("name", "")) == direct_name]
+    if any(not _derived_from(proxies[idx], expected) for idx in existing):
+        # Same name, different connection: somebody else's node (a user node or a
+        # leftover from an earlier VPS identity).  Leave it alone and report; a
+        # silent overwrite would destroy a node the user created.
+        summary["warnings"].append(
+            f"节点名称 {direct_name!r} 已被占用且连接参数与当前 VPS 不一致，"
+            "已保留原节点并跳过 VPS 直连节点生成（若是旧配置残留，请手动删除该节点）")
+        summary["direct_node_skipped"] = "name-conflict"
+        return ""
+
+    if existing:
+        keep = existing[0]
+        for idx in reversed(existing[1:]):      # collapse older duplicates
+            del proxies[idx]
+        proxies[keep] = expected
+    else:
+        chain_name = str(options.get("ai_chain_node_name") or "")
+        chain_idx = next((idx for idx, proxy in enumerate(proxies)
+                          if isinstance(proxy, dict)
+                          and str(proxy.get("name", "")) == chain_name), None)
+        if chain_idx is None:
+            proxies.append(expected)
+        else:
+            proxies.insert(chain_idx + 1, expected)   # sits right after the chain
+    summary["direct_node"] = direct_name
+    return direct_name
+
+
 def update_rules(rules: CommentedSeq, options: Dict[str, Any],
                  stream_group: Optional[str],
                  ai_chain_group: Optional[str]) -> Tuple[CommentedSeq, int]:
@@ -570,7 +811,13 @@ def build_optimized_profile(data: Dict[str, Any],
         "front_group": "",
         "stream_group": "",
         "ai_group": "",
+        "ai_group_members": [],
         "chain_node": "",
+        "chain_entry": "",
+        "chain_entry_requested": "",
+        "chain_entry_problem": "",
+        "direct_node": "",
+        "landing_node": "",
         "groups_added": [],
         "rules_touched": 0,
         "warnings": [],
@@ -626,16 +873,9 @@ def build_optimized_profile(data: Dict[str, Any],
             f"已清理 {len(removed)} 个过期机场节点: {', '.join(removed[:8])}"
             + (" ..." if len(removed) > 8 else ""))
 
-    # 3. Los Angeles VPS landing node.
-    landing = find_proxy(proxies, str(opts.get("chain_landing_node_name") or ""))
-    if landing is None:
-        for proxy in proxies:
-            if not isinstance(proxy, dict):
-                continue
-            name = str(proxy.get("name", ""))
-            if "reality" in name.lower() or "vps" in name.lower():
-                landing = proxy
-                break
+    # 3. Los Angeles VPS landing node (exact name first, keyword scan fallback).
+    landing = resolve_landing_node(proxies, opts, summary)
+    summary["landing_node"] = str(landing.get("name", "")) if isinstance(landing, dict) else ""
 
     front_names = airport_front_nodes(airport_nodes, opts)
     front_group_name = str(opts["front_group_name"])
@@ -663,22 +903,44 @@ def build_optimized_profile(data: Dict[str, Any],
         daily_group = _select_group(daily_group_name, daily_members)
         groups_added.append(f"{_upsert_group(groups, daily_group)}:{daily_group_name}")
 
-    # 3b. Chained AI landing: exactly one member (no fallback noise).
+    # 3b. Chained AI landing + its direct twin.
+    # The chain node stays the only member that carries dialer-proxy; the direct
+    # twin is derived from it, never from the landing node itself.
+    direct_name = ""
     if airport_nodes and front_names and landing is not None:
         chain_name = str(opts["ai_chain_node_name"])
+        # Manual "chain entry" (dialer-proxy) selection; "" keeps the verified
+        # airport front group. An unknown/stale value falls back safely and is
+        # reported so the write preflight can block it.
+        chain_entry_target, chain_entry_problem = resolve_chain_entry(
+            opts.get("chain_entry_node"), proxies, opts, summary)
+        summary["chain_entry"] = chain_entry_target
+        summary["chain_entry_requested"] = str(opts.get("chain_entry_node") or "")
+        summary["chain_entry_problem"] = chain_entry_problem
+        chain_node = _build_chain_node(landing, opts, chain_entry_target)
         for idx, proxy in enumerate(proxies):
             if isinstance(proxy, dict) and str(proxy.get("name", "")) == chain_name:
-                proxies[idx] = _build_chain_node(landing, opts, front_group_name)
+                proxies[idx] = chain_node
                 break
         else:
-            proxies.append(_build_chain_node(landing, opts, front_group_name))
+            proxies.append(chain_node)
         summary["chain_node"] = chain_name
 
+        landing_problem = vless_node_problem(landing)
+        if landing_problem:
+            summary["warnings"].append(
+                f"VPS 落地节点不是有效 VLESS 节点（{landing_problem}），跳过直连节点生成")
+        else:
+            direct_name = _upsert_direct_node(proxies, chain_node, opts, summary)
+
         ai_group_name = str(opts["ai_chain_group_name"])
-        ai_group = _select_group(ai_group_name, [chain_name])
+        # Order is fixed: chain first (manual default), direct second.
+        ai_members = [chain_name] + ([direct_name] if direct_name else [])
+        ai_group = _select_group(ai_group_name, ai_members)
         groups_added.append(f"{_upsert_group(groups, ai_group)}:{ai_group_name}")
         ai_chain_group = ai_group_name
         summary["ai_group"] = ai_group_name
+        summary["ai_group_members"] = list(ai_members)
     elif airport_nodes and front_names:
         summary["warnings"].append("未找到洛杉矶 VPS 落地节点，无法创建 dialer-proxy 链式节点")
 
@@ -694,10 +956,12 @@ def build_optimized_profile(data: Dict[str, Any],
         main_group = _select_group(main_name, [])
         groups.append(main_group)
         summary["warnings"].append(f"主策略组 {main_name} 缺失，已新建")
-    top_members = [daily_group_name, stream_group_name, ai_chain_group or "", "DIRECT"]
-    main_group["proxies"] = cseq([m for m in top_members if m])
+    top_members = [daily_group_name, stream_group_name, ai_chain_group or "",
+                   direct_name, "DIRECT"]
+    top_members = [m for m in dict.fromkeys(top_members) if m]
+    main_group["proxies"] = cseq(top_members)
     main_group["type"] = "select"
-    summary["proxy_members"] = [m for m in top_members if m]
+    summary["proxy_members"] = list(top_members)
 
     # 5. Drop obsolete/zombie groups and sanitise every member list.
     obsolete = {str(n) for n in (opts.get("obsolete_group_names") or []) if n}

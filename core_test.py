@@ -90,14 +90,75 @@ def _popen_kwargs() -> Dict[str, Any]:
     return kwargs
 
 
+def verify_cfst_binary(path: str) -> Dict[str, Any]:
+    """Existence/size/architecture check for the external speed-test core.
+
+    Returned dict is safe to log (path, sizes, arch string only).
+    """
+    info: Dict[str, Any] = {"path": str(path or ""), "exists": False, "size": 0,
+                            "machine": "", "arch": "", "ok": False, "error": ""}
+    try:
+        info["exists"] = bool(path) and os.path.isfile(path)
+        if info["exists"]:
+            info["size"] = os.path.getsize(path)
+    except OSError as exc:
+        info["error"] = f"无法读取文件: {exc}"
+        return info
+    if not info["exists"]:
+        info["error"] = "文件不存在（请确认 bin\\cfst.exe 与 EXE 在同一目录）"
+        return info
+    if info["size"] < 1_000_000:
+        info["error"] = f"文件过小（{info['size']} 字节），可能不是完整二进制"
+        return info
+    try:
+        import struct
+        with open(path, "rb") as handle:
+            head = handle.read(0x400)
+        if head[:2] != b"MZ":
+            info["error"] = "不是有效的 Windows 可执行文件（缺少 MZ 头）"
+            return info
+        offset = struct.unpack_from("<I", head, 0x3C)[0]
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            pe = handle.read(6)
+        machine = struct.unpack_from("<H", pe, 4)[0]
+        info["machine"] = f"0x{machine:04x}"
+        info["arch"] = {0x8664: "x64", 0x014c: "x86", 0xAA64: "arm64"}.get(machine, "未知")
+        if machine != 0x8664:
+            info["error"] = f"架构为 {info['arch']}（{info['machine']}），期望 x64"
+            return info
+    except Exception as exc:
+        info["error"] = f"PE 头解析失败: {exc}"
+        return info
+    info["ok"] = True
+    return info
+
+
 def _run_cfst(cmd: List[str], cwd: str, log: Callable[[str], None],
               is_stopped: Callable[[], bool],
               register_proc: Optional[Callable[[Any], None]] = None) -> int:
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL, text=True, cwd=cwd,
-        encoding="utf-8", errors="replace", **_popen_kwargs(),
-    )
+    """Run cfst.exe with a non-interactive stdin and surface failures.
+
+    ``stdin=DEVNULL`` plus the caller's ``-p 0`` guarantee the helper can never
+    block on the "Press Enter to exit" prompt; a non-zero exit code is logged
+    with the tail of the captured output so the GUI log/status bar shows why.
+    """
+    exe = str(cmd[0]) if cmd else ""
+    if exe and not os.path.isfile(exe):
+        log(f"❌ 找不到测速核心: {exe}")
+        log("   请确认 bin\\cfst.exe 与主程序在同一目录（v1.3 发布包已自带）")
+        return -2
+    tail: List[str] = []
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, cwd=cwd,
+            encoding="utf-8", errors="replace", **_popen_kwargs(),
+        )
+    except OSError as exc:
+        log(f"❌ 启动测速核心失败: {exc}")
+        log(f"   命令: {' '.join(cmd)}")
+        return -3
     if register_proc:
         try:
             register_proc(proc)
@@ -113,6 +174,8 @@ def _run_cfst(cmd: List[str], cwd: str, log: Callable[[str], None],
                 break
             line_str = line.rstrip()
             if line_str:
+                tail.append(line_str)
+                del tail[:-6]
                 log(line_str)
         proc.wait()
     finally:
@@ -121,7 +184,11 @@ def _run_cfst(cmd: List[str], cwd: str, log: Callable[[str], None],
                 register_proc(None)
             except Exception:
                 pass
-    return proc.returncode
+    if proc.returncode != 0:
+        log(f"❌ 测速核心退出码 {proc.returncode}: {exe}")
+        if tail:
+            log("   最后输出: " + " | ".join(tail[-3:]))
+    return int(proc.returncode or 0)
 
 
 def parse_result_csv(path: str, sl_filter: float = 0.0) -> List[Dict[str, Any]]:
@@ -234,17 +301,19 @@ def run_health_check(cfst_exe: str, node_info: List[Dict[str, Any]], clash_api: 
                        "-tl", "2000", "-sl", "0", "-dt", "4", "-p", "0",
                        "-o", result_file]
                 log(f"执行命令: {' '.join(cmd)}")
-                _run_cfst(cmd, bin_dir, log, is_stopped, register_proc)
+                rc = _run_cfst(cmd, bin_dir, log, is_stopped, register_proc)
         else:
             cmd = [cfst_exe, "-f", ip_file, "-dn", str(len(current_ips)),
                    "-tl", "2000", "-sl", "0", "-dt", "4", "-p", "0",
                    "-o", result_file]
-            _run_cfst(cmd, bin_dir, log, is_stopped, register_proc)
+            rc = _run_cfst(cmd, bin_dir, log, is_stopped, register_proc)
         log("🧹 已自动清理内核临时路由")
 
         rows = parse_result_csv(result_file)
         if rows:
             log(f"✅ 获取到 {len(rows)} 条实测数据")
+        elif rc != 0:
+            log(f"❌ 体检失败：cfst.exe 退出码 {rc}（原因见上方输出）")
         else:
             log("⚠ 未生成测速结果文件")
 
@@ -275,6 +344,43 @@ def run_health_check(cfst_exe: str, node_info: List[Dict[str, Any]], clash_api: 
         return final
 
 
+def build_speed_test_command(cfst_exe: str, ip_file: str, result_file: str,
+                             threads: int = 200, tl: int = 400,
+                             dn: int = 10, url: str = "") -> List[str]:
+    """Full-speed-test command line with an explicit absolute ``-f`` path.
+
+    ``-p 0`` disables cfst's "press Enter to exit" prompt; both file paths are
+    absolute so a packaged (frozen) EXE never resolves them against the
+    temporary ``_MEIPASS`` folder.
+    """
+    cmd = [str(cfst_exe), "-f", os.path.abspath(str(ip_file)),
+           "-n", str(threads), "-tl", str(tl), "-sl", "0",
+           "-dn", str(dn), "-p", "0", "-o", os.path.abspath(str(result_file))]
+    if url:
+        cmd.extend(["-url", str(url)])
+    return cmd
+
+
+def default_ip_list_file(bin_dir: str,
+                         log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Resolved ``ip.txt`` for the full speed test (package → data → generated)."""
+    log = log or _noop
+    try:
+        from path_utils import resolve_ip_list_file
+        info = resolve_ip_list_file(create=True, data_bin=bin_dir)
+    except Exception as exc:
+        info = {"path": os.path.join(bin_dir, "ip.txt"), "source": "missing",
+                "exists": False, "generated": False}
+        log(f"⚠ 解析 ip.txt 失败: {exc}")
+    if info.get("generated"):
+        log(f"📄 未找到 ip.txt，已生成内置官方 Cloudflare IPv4 CIDR 兜底: {info['path']}")
+    elif info.get("exists"):
+        log(f"📄 IP 列表: {info['path']}（来源: {info['source']}）")
+    else:
+        log(f"⚠ 缺少 IP 列表文件且无法生成: {info.get('path')}")
+    return info
+
+
 def run_speed_test(cfst_exe: str, bin_dir: str, ip_file: Optional[str] = None,
                    threads: int = 200, tl: int = 400, sl_filter: float = 5.0,
                    dn: int = 10, url: str = "",
@@ -283,11 +389,14 @@ def run_speed_test(cfst_exe: str, bin_dir: str, ip_file: Optional[str] = None,
                    register_proc: Optional[Callable[[Any], None]] = None) -> List[Dict[str, Any]]:
     """Full Cloudflare speed test over a prepared candidate list."""
     log = log or _noop
-    ip_file = ip_file or os.path.join(bin_dir, "ip.txt")
+    if not ip_file:
+        info = default_ip_list_file(bin_dir, log)
+        ip_file = info.get("path") or os.path.join(bin_dir, "ip.txt")
+    ip_file = os.path.abspath(str(ip_file))
     if not os.path.exists(ip_file):
         raise FileNotFoundError(f"找不到 IP 列表文件: {ip_file}")
 
-    result_file = os.path.join(bin_dir, "result.csv")
+    result_file = os.path.abspath(os.path.join(bin_dir, "result.csv"))
     if os.path.exists(result_file):
         try:
             os.remove(result_file)
@@ -297,23 +406,24 @@ def run_speed_test(cfst_exe: str, bin_dir: str, ip_file: Optional[str] = None,
     with open(ip_file, "r", encoding="utf-8", errors="replace") as f:
         candidates = [line.strip() for line in f
                       if line.strip() and not line.strip().startswith("#")]
+    log(f"📄 测速候选: {len(candidates)} 条（-f {ip_file}）")
 
     with _CfstSlot(log):
         log("🛡️ 注入候选 IP 网段的 TUN 绕过路由...")
         targets = bypass_targets_for_ips(candidates)
         with RouteBypassContext(targets):
-            cmd = [cfst_exe, "-f", ip_file, "-n", str(threads), "-tl", str(tl),
-                   "-sl", "0", "-dn", str(dn), "-p", "0", "-o", result_file]
-            if url:
-                cmd.extend(["-url", url])
+            cmd = build_speed_test_command(cfst_exe, ip_file, result_file,
+                                           threads=threads, tl=tl, dn=dn, url=url)
             log(f"🚀 启动全网测速: {' '.join(cmd)}")
-            _run_cfst(cmd, bin_dir, log, is_stopped, register_proc)
+            rc = _run_cfst(cmd, bin_dir, log, is_stopped, register_proc)
         log("🧹 已自动清理全网 CIDR 临时路由")
 
     results = parse_result_csv(result_file, sl_filter=sl_filter)
     if results:
         log(f"✅ 全网测速完成，共生成 {len(results)} 条候选结果 "
             f"(速度过滤下限: {sl_filter} MB/s)")
+    elif rc != 0:
+        log(f"❌ 全网测速失败：cfst.exe 退出码 {rc}（原因见上方输出）")
     else:
         log("⚠ 未生成全网测速结果文件")
     return results
